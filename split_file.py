@@ -152,31 +152,38 @@ def split_file(file_path: str, column_name: str, output_dir: str = None,
     """
     Split the input file by grouping on the specified column_name.
     """
-    if not os.path.exists(file_path):
-        print(f"ERROR: File not found: {file_path}", file=sys.stderr)
-        sys.exit(1)
+    if os.path.isdir(file_path):
+        files = [
+            os.path.join(file_path, f) for f in sorted(os.listdir(file_path))
+            if f.lower().endswith(('.csv', '.xlsx', '.xls')) and not f.startswith('~$')
+        ]
+        if not files:
+            print(f"ERROR: No CSV or Excel files found in directory '{file_path}'.", file=sys.stderr)
+            sys.exit(1)
 
-    print(f"Reading {file_path}...")
-    df = load_file(file_path, sheet_name=sheet_name)
+        print(f"Directory detected. Combining {len(files)} file(s) from '{file_path}'...")
+        dfs = [load_file(f, sheet_name=sheet_name) for f in files]
+        df = pd.concat(dfs, ignore_index=True, sort=False)
+        _, input_ext = os.path.splitext(files[0].lower())
+    else:
+        print(f"Reading {file_path}...")
+        df = load_file(file_path, sheet_name=sheet_name)
+        _, input_ext = os.path.splitext(file_path.lower())
 
     # Validate column exists
     if column_name not in df.columns:
-        # Provide helpful case-insensitive search or list available columns
         cols_lower = {str(c).strip().lower(): c for c in df.columns}
         matched_col = cols_lower.get(column_name.strip().lower())
         if matched_col:
             print(f"WARNING: Exact column '{column_name}' not found. Using matched column '{matched_col}'.")
             column_name = matched_col
         else:
-            print(f"ERROR: Column '{column_name}' not found in the file.", file=sys.stderr)
+            print(f"ERROR: Column '{column_name}' not found in dataset.", file=sys.stderr)
             print(f"Available columns are: {list(df.columns)}", file=sys.stderr)
             sys.exit(1)
 
     total_rows = len(df)
-    print(f"Loaded {total_rows} rows. Grouping by column '{column_name}'...")
-
-    # Determine input extension
-    _, input_ext = os.path.splitext(file_path.lower())
+    print(f"Loaded {total_rows:,} rows. Grouping by column '{column_name}'...")
 
     # Set default output directory if not provided
     if not output_dir:
