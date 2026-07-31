@@ -1,2 +1,33 @@
-/*pipeline*
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE / Editor settings
+.vscode/
+.idea/
+*.swp
+*~
+
+# Pipeline output directories & data artifacts
+pipeline_output/
 graphify*
+
+# Large data CSV & Excel files (keep scripts & tests tracked)
+*.csv
+*.xlsx
+*.xls
+
+# Logs
+*.log
