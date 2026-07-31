@@ -7,10 +7,12 @@ populates Agent Level via a composite lookup, and saves the final result.
 """
 
 import argparse
+import math
 import os
 import sys
 import time
 import pandas as pd
+from typing import Tuple
 
 
 def clean_key(series: pd.Series) -> pd.Series:
@@ -46,8 +48,28 @@ def format_amount(val: float) -> str:
     return f"${val:,.2f}"
 
 
+def parse_rate(val) -> float:
+    """Parses percentage strings into float values."""
+    if pd.isna(val):
+        return 0.0
+    val_str = str(val).strip().replace("%", "").strip()
+    if not val_str:
+        return 0.0
+    try:
+        return float(val_str)
+    except ValueError:
+        return 0.0
+
+
+def format_rate(val: float) -> str:
+    """Formats float values into percentage strings (e.g. '16.66 %')."""
+    return f"{val:.2f} %"
+
+
 def clean_id_and_quote_values(df: pd.DataFrame) -> pd.DataFrame:
     """Strips leading/trailing quotes from text columns and removes '.0' suffix from numeric IDs."""
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
     def _clean_val(val):
         if pd.isna(val):
             return val
@@ -60,14 +82,18 @@ def clean_id_and_quote_values(df: pd.DataFrame) -> pd.DataFrame:
     id_cols = ["Policy No", "Agent ID", "EACID", "Policy Number"]
     for col in df.columns:
         c_lower = str(col).strip().lower()
+        target_series = df[col]
+        if isinstance(target_series, pd.DataFrame):
+            target_series = target_series.iloc[:, 0]
+
         if c_lower == "to month":
-            df[col] = df[col].apply(
+            df[col] = target_series.apply(
                 lambda x: "" if pd.isna(x) or str(x).strip().lstrip("'").rstrip("'").strip('"') in ("0", "0.0") else str(x).strip().lstrip("'").rstrip("'").strip('"')
             )
         elif col in id_cols or "id" in c_lower or "no" in c_lower or "number" in c_lower:
-            df[col] = df[col].apply(_clean_val)
-        elif df[col].dtype == object or df[col].dtype == 'string':
-            df[col] = df[col].apply(lambda x: str(x).lstrip("'").rstrip("'").strip('"') if pd.notna(x) else x)
+            df[col] = target_series.apply(_clean_val)
+        elif target_series.dtype == object or target_series.dtype == 'string':
+            df[col] = target_series.apply(lambda x: str(x).lstrip("'").rstrip("'").strip('"') if pd.notna(x) else x)
 
     return df
 
@@ -192,8 +218,8 @@ def process_single_split_file(
     ref_key_col: str = "Agent Name",
     ref_val_col: str = None,
     ref_target_col: str = None,
-) -> pd.DataFrame:
-    """Processes sequence adjustments, populates master lookup, and applies reference updates for a single split file."""
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Processes sequence adjustments, populates master lookup, applies reference updates, and separates OVR rows for a single split file."""
     _, ext = os.path.splitext(base_file_path.lower())
     if ext in ('.xlsx', '.xls'):
         base_df = pd.read_excel(base_file_path)
@@ -208,43 +234,146 @@ def process_single_split_file(
         if col not in base_df.columns:
             raise KeyError(f"Required column '{col}' missing in '{os.path.basename(base_file_path)}'.")
 
-    # Sequence adjustments
-    base_df["_amt_numeric"] = base_df["Amount"].apply(parse_amount)
-    group_seq_amts = {}
-    for idx, row in base_df.iterrows():
-        pol = row["Policy No"]
-        fm = row["From Month"]
-        seq = int(pd.to_numeric(row["Sequence"], errors="coerce"))
-        amt = row["_amt_numeric"]
+    # Separate OVR rows if Product contains 'ovr'
+    prod_col = None
+    for col in base_df.columns:
+        if str(col).strip().lower() in ("product", "product name"):
+            prod_col = col
+            break
 
-        key = (pol, fm)
-        if key not in group_seq_amts:
-            group_seq_amts[key] = {}
-        if seq not in group_seq_amts[key]:
-            group_seq_amts[key][seq] = amt
+    ovr_df = pd.DataFrame()
+    if prod_col is not None:
+        ovr_mask = base_df[prod_col].astype(str).str.contains("ovr", case=False, na=False)
+        ovr_df = base_df[ovr_mask].copy()
+        base_df = base_df[~ovr_mask].copy()
 
-    new_amounts = []
-    for idx, row in base_df.iterrows():
-        pol = row["Policy No"]
-        fm = row["From Month"]
-        seq = int(pd.to_numeric(row["Sequence"], errors="coerce"))
-        amt = row["_amt_numeric"]
-        orig_amt_str = row["Amount"]
+        if len(ovr_df) > 0 and ref_file_path:
+            ovr_df = apply_reference_updates(
+                df=ovr_df,
+                ref_file_path=ref_file_path,
+                key_col=ref_key_col,
+                val_col=ref_val_col,
+                target_col=ref_target_col,
+            )
+            ovr_df = clean_id_and_quote_values(ovr_df)
 
-        if amt > 0:
-            prev_seq = seq - 1
-            key = (pol, fm)
-            if key in group_seq_amts and prev_seq in group_seq_amts[key]:
-                prev_amt = group_seq_amts[key][prev_seq]
-                new_amt_num = amt - prev_amt
-                new_amounts.append(format_amount(new_amt_num))
+    # Sequence adjustments and Rate calculations for non-OVR rows matching (Policy No, Product, From Month)
+    if "Rate" not in base_df.columns:
+        base_df["Rate"] = "0.00 %"
+
+    base_df["Carrier Commission"] = "$0.00"
+    base_df["Payout Method"] = ""
+    base_df["_amt_num"] = base_df["Amount"].apply(parse_amount)
+    base_df["_rate_num"] = base_df["Rate"].apply(parse_rate)
+    base_df["_seq_num"] = pd.to_numeric(base_df["Sequence"], errors="coerce").fillna(1).astype(int)
+
+    base_df["_pol_clean"] = clean_key(base_df["Policy No"])
+    base_df["_prod_clean"] = clean_key(base_df["Product"])
+    base_df["_fm_clean"] = clean_key(base_df["From Month"])
+
+    grouped = base_df.groupby(["_pol_clean", "_prod_clean", "_fm_clean"], sort=False)
+
+    for _, group in grouped:
+        indices = group.index.tolist()
+        rates = group["_rate_num"].tolist()
+        amounts = group["_amt_num"].tolist()
+        seqs = group["_seq_num"].tolist()
+
+        has_nonzero_rate = any(r > 0 for r in rates)
+
+        seq_amt_map = {}
+        seq_rate_map = {}
+        for s, a, r in zip(seqs, amounts, rates):
+            if s not in seq_amt_map:
+                seq_amt_map[s] = a
+            if s not in seq_rate_map:
+                seq_rate_map[s] = r
+
+        max_seq = max(seqs) if seqs else 1
+
+        if not has_nonzero_rate:
+            # CASE 1: All Rate values are 0 in the group (Policy No, Product, From Month)
+            adj_amounts = []
+            for s, a in zip(seqs, amounts):
+                if a > 0:
+                    prev_seq = s - 1
+                    if prev_seq in seq_amt_map:
+                        prev_amt = seq_amt_map[prev_seq]
+                        adj_amounts.append(max(0.0, a - prev_amt))
+                    else:
+                        adj_amounts.append(a)
+                else:
+                    adj_amounts.append(a)
+
+            total_amt = seq_amt_map.get(max_seq, max(amounts) if amounts else 0.0)
+
+            rates_calc = []
+            if total_amt > 0:
+                non_highest_rate_sum = 0.0
+                highest_seq_indices_in_group = [i for i, s in enumerate(seqs) if s == max_seq]
+                primary_highest_idx = highest_seq_indices_in_group[-1]
+
+                for i, adj_a in enumerate(adj_amounts):
+                    if i != primary_highest_idx:
+                        raw_pct = (adj_a / total_amt) * 100.0
+                        trunc_pct = math.floor(raw_pct * 100.0) / 100.0
+                        rates_calc.append(trunc_pct)
+                        non_highest_rate_sum += trunc_pct
+                    else:
+                        rates_calc.append(None)
+
+                highest_rate = round(100.00 - non_highest_rate_sum, 2)
+                rates_calc[primary_highest_idx] = highest_rate
             else:
-                new_amounts.append(orig_amt_str)
-        else:
-            new_amounts.append(orig_amt_str)
+                rates_calc = [0.0] * len(indices)
 
-    base_df["Amount"] = new_amounts
-    base_df = base_df.drop(columns=["_amt_numeric"])
+            carrier_comm_str = format_amount(total_amt)
+            for global_idx, adj_a, r_val in zip(indices, adj_amounts, rates_calc):
+                base_df.loc[global_idx, "Amount"] = format_amount(adj_a)
+                base_df.loc[global_idx, "Rate"] = format_rate(r_val)
+                base_df.loc[global_idx, "Carrier Commission"] = carrier_comm_str
+                base_df.loc[global_idx, "Payout Method"] = "FIXED FEE"
+
+        else:
+            # CASE 2: At least one Rate value > 0 in the group (Policy No, Product, From Month)
+            rate_diffs = []
+            for s, r in zip(seqs, rates):
+                prev_seq = s - 1
+                if prev_seq in seq_rate_map:
+                    prev_r = seq_rate_map[prev_seq]
+                    rate_diffs.append(max(0.0, r - prev_r) if r > prev_r else r)
+                else:
+                    rate_diffs.append(r)
+
+            total_rate = seq_rate_map.get(max_seq, max(rates) if rates else 0.0)
+
+            rates_calc = []
+            if total_rate > 0:
+                non_highest_rate_sum = 0.0
+                highest_seq_indices_in_group = [i for i, s in enumerate(seqs) if s == max_seq]
+                primary_highest_idx = highest_seq_indices_in_group[-1]
+
+                for i, r_diff in enumerate(rate_diffs):
+                    if i != primary_highest_idx:
+                        raw_pct = (r_diff / total_rate) * 100.0
+                        trunc_pct = math.floor(raw_pct * 100.0) / 100.0
+                        rates_calc.append(trunc_pct)
+                        non_highest_rate_sum += trunc_pct
+                    else:
+                        rates_calc.append(None)
+
+                highest_rate = round(100.00 - non_highest_rate_sum, 2)
+                rates_calc[primary_highest_idx] = highest_rate
+            else:
+                rates_calc = [0.0] * len(indices)
+
+            carrier_comm_str = format_rate(total_rate)
+            for global_idx, r_val in zip(indices, rates_calc):
+                base_df.loc[global_idx, "Rate"] = format_rate(r_val)
+                base_df.loc[global_idx, "Carrier Commission"] = carrier_comm_str
+                base_df.loc[global_idx, "Payout Method"] = "PERCENTAGE"
+
+    base_df = base_df.drop(columns=["_amt_num", "_rate_num", "_seq_num", "_pol_clean", "_prod_clean", "_fm_clean"])
 
     # Master Lookup Mapping
     base_df["_pol_key"] = clean_key(base_df["Policy No"])
@@ -283,7 +412,58 @@ def process_single_split_file(
         )
 
     output_df = clean_id_and_quote_values(output_df)
-    return output_df
+    output_df = propagate_carrier_by_policy(output_df)
+    return output_df, ovr_df
+
+
+def propagate_carrier_by_policy(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Groups DataFrame by (Policy No, Product) and propagates non-empty policy-level metadata
+    (Carrier, LOB, Pay Mode, Payment Frequency, Premium) across all rows belonging to the same policy.
+    """
+    if df is None or len(df) == 0:
+        return df
+
+    pol_col = None
+    prod_col = None
+    for col in df.columns:
+        c_lower = str(col).strip().lower()
+        if c_lower in ("policy no", "policy number", "policyno", "policynumber") and not pol_col:
+            pol_col = col
+        elif c_lower in ("product", "product name", "prod") and not prod_col:
+            prod_col = col
+
+    if not pol_col:
+        return df
+
+    meta_cols = ["Carrier", "LOB", "Pay Mode", "Payment Frequency", "Premium", "Carrier Commission", "Payout Method"]
+    target_meta_cols = [c for c in meta_cols if c in df.columns]
+
+    if not target_meta_cols:
+        return df
+
+    pol_key_ser = clean_key(df[pol_col])
+    prod_key_ser = clean_key(df[prod_col]) if prod_col else pd.Series([""] * len(df), index=df.index)
+
+    temp_df = pd.DataFrame({"_g_pol": pol_key_ser, "_g_prod": prod_key_ser}, index=df.index)
+
+    def _fill_series(series):
+        valid = series.dropna()
+        valid = valid[valid.astype(str).str.strip().str.upper().replace({"\\N": "", "NAN": "", "NONE": ""}) != ""]
+        if not valid.empty:
+            first_val = valid.iloc[0]
+            return series.apply(
+                lambda x: first_val if pd.isna(x) or str(x).strip().upper() in ("", "\\N", "NAN", "NONE") else x
+            )
+        return series
+
+    group_cols = ["_g_pol", "_g_prod"] if prod_col else ["_g_pol"]
+
+    for m_col in target_meta_cols:
+        temp_df[m_col] = df[m_col]
+        df[m_col] = temp_df.groupby(group_cols, sort=False)[m_col].transform(_fill_series)
+
+    return df
 
 
 def save_carrier_splits(df: pd.DataFrame, split_dir: str):
@@ -414,6 +594,10 @@ def main():
     print("[1/3] Loading master Excel file...", end="", flush=True)
     try:
         master_df = pd.read_excel(args.master_file)
+        if "Policy Number" in master_df.columns and "Policy No" not in master_df.columns:
+            master_df = master_df.rename(columns={"Policy Number": "Policy No"})
+        if "Product Name" in master_df.columns and "Product" not in master_df.columns:
+            master_df = master_df.rename(columns={"Product Name": "Product"})
         if "Agent Name" in master_df.columns:
             master_df["Agent Name"] = master_df["Agent Name"].fillna("").astype(str).apply(lambda s: " ".join(s.split()))
         print(f" Done ({len(master_df):,} rows)")
@@ -421,7 +605,7 @@ def main():
         print(f"\n❌ Error loading master file: {e}", file=sys.stderr)
         sys.exit(1)
 
-    required_master_cols = ["Policy No", "Product", "Agent Name", "Agent Level"]
+    required_master_cols = ["Policy No", "Product", "Agent Name"]
     for col in required_master_cols:
         if col not in master_df.columns:
             print(f"❌ Error: Required column '{col}' missing in master file.", file=sys.stderr)
@@ -443,12 +627,14 @@ def main():
 
     processed_dfs = []
     total_processed_rows = 0
+    total_ovr_rows = 0
+    ovr_comm_dir = os.path.join(comm_import_dir, "commission_ovr")
 
     for idx, filepath in enumerate(input_files, 1):
         filename = os.path.basename(filepath)
         print(f"  ({idx}/{len(input_files)}) Enriching '{filename}'...", end="", flush=True)
         try:
-            out_df = process_single_split_file(
+            out_df, ovr_df = process_single_split_file(
                 base_file_path=filepath,
                 master_df=master_df,
                 ref_file_path=args.ref_file,
@@ -471,6 +657,15 @@ def main():
             out_df.to_csv(single_out_path, index=False)
             print(f"     💾 Saved: {single_out_path}")
 
+            # Save separated OVR commission file if present
+            if len(ovr_df) > 0:
+                total_ovr_rows += len(ovr_df)
+                os.makedirs(ovr_comm_dir, exist_ok=True)
+                raw_name = os.path.splitext(filename)[0]
+                ovr_out_path = os.path.join(ovr_comm_dir, f"{raw_name}_commission_OVR.csv")
+                ovr_df.to_csv(ovr_out_path, index=False)
+                print(f"     📦 Saved {len(ovr_df):,} commission OVR row(s) into '{ovr_out_path}'")
+
         except Exception as e:
             print(f" FAILED ({e})")
             continue
@@ -480,6 +675,7 @@ def main():
         sys.exit(1)
 
     combined_df = pd.concat(processed_dfs, ignore_index=True)
+    combined_df = propagate_carrier_by_policy(combined_df)
 
     # 5. Split commission import data by Carrier inside commission_import/split_commission/
     print("[3/3] Generating Carrier-wise splits for Commission Import...", end="", flush=True)
@@ -494,7 +690,9 @@ def main():
     print("📊 EXECUTION SUMMARY")
     print("=" * 74)
     print(f" Input Files Processed:     {len(processed_dfs):,}")
-    print(f" Total Rows Processed:      {total_processed_rows:,}")
+    print(f" Clean Commission Rows:     {total_processed_rows:,}")
+    if total_ovr_rows > 0:
+        print(f" OVR Rows Separated:         {total_ovr_rows:,} ({os.path.abspath(ovr_comm_dir)})")
     print(f" Matched Agent Levels:      {matched_count:,} ({match_pct:.2f}%)")
     print(f" Commission Import Folder:  {os.path.abspath(comm_import_dir)}")
     print(f" Carrier Split Directory:   {os.path.abspath(split_comm_dir)}")
