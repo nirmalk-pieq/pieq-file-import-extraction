@@ -289,14 +289,14 @@ def enrich_policy_data(
                     target_col=ref_target_col,
                 )
             output_dir = os.path.dirname(output_file_path)
-            ovr_dir = os.path.join(output_dir, "ovr") if output_dir else "ovr"
+            ovr_dir = os.path.join(output_dir, "policy_ovr") if output_dir else "policy_ovr"
             os.makedirs(ovr_dir, exist_ok=True)
 
             base_name = os.path.splitext(os.path.basename(output_file_path))[0]
-            ovr_file_path = os.path.join(ovr_dir, f"{base_name}_OVR.xlsx")
+            ovr_file_path = os.path.join(ovr_dir, f"{base_name}_policy_OVR.xlsx")
             ovr_df = clean_id_and_quote_values(ovr_df)
             ovr_df.to_excel(ovr_file_path, index=False, engine='xlsxwriter')
-            print(f"\n📦 Saved {ovr_count:,} OVR row(s) into '{ovr_file_path}'")
+            print(f"\n📦 Saved {ovr_count:,} policy OVR row(s) into '{ovr_file_path}'")
 
     print(" Done")
 
