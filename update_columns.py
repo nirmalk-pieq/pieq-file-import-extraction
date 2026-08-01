@@ -144,9 +144,10 @@ def is_value_missing(val) -> bool:
 def build_norm_key(df: pd.DataFrame, key_cols: List[str]) -> pd.Series:
     """
     Build a composite normalized key string joined by '||' from multiple columns.
+    Normalizes case, outer spaces, and collapses multiple internal spaces.
     """
     def row_to_key(row):
-        parts = [str(val).strip().lower() for val in row]
+        parts = [" ".join(str(val).strip().lower().split()) for val in row]
         return "||".join(parts)
     return df[key_cols].apply(row_to_key, axis=1)
 
