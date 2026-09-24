@@ -2,6 +2,7 @@
 import os
 import sys
 import argparse
+import difflib
 from typing import Union, List, Dict
 import pandas as pd
 import numpy as np
@@ -151,12 +152,56 @@ def build_norm_key(df: pd.DataFrame, key_cols: List[str]) -> pd.Series:
         return "||".join(parts)
     return df[key_cols].apply(row_to_key, axis=1)
 
-def update_columns(source_path: str, key_column: Union[str, List[str]], update_cols: List[str],
+def parse_column_pairs(cols_input: Union[str, List[str]], target_cols_input: Union[str, List[str], None] = None) -> tuple:
+    """
+    Parse source and target column specifications.
+    Supports:
+    1. Colon format in cols_input: "SourceCol1:TargetCol1, SourceCol2:TargetCol2" or ["SourceCol1:TargetCol1", ...]
+    2. Separate target_cols_input: cols_input="Source1, Source2", target_cols_input="Target1, Target2"
+    3. Identical names: cols_input="Col1, Col2", target_cols_input=None -> ("Col1, Col2", "Col1, Col2")
+    """
+    if isinstance(cols_input, str):
+        raw_items = [c.strip() for c in cols_input.split(",") if c.strip()]
+    else:
+        raw_items = [str(c).strip() for c in cols_input if str(c).strip()]
+
+    source_cols = []
+    target_cols = []
+
+    has_colon = any(":" in item for item in raw_items)
+
+    if has_colon:
+        for item in raw_items:
+            if ":" in item:
+                s, t = item.split(":", 1)
+                source_cols.append(s.strip())
+                target_cols.append(t.strip())
+            else:
+                source_cols.append(item.strip())
+                target_cols.append(item.strip())
+    else:
+        source_cols = raw_items
+        if target_cols_input is not None:
+            if isinstance(target_cols_input, str):
+                target_cols = [c.strip() for c in target_cols_input.split(",") if c.strip()]
+            else:
+                target_cols = [str(c).strip() for c in target_cols_input if str(c).strip()]
+        else:
+            target_cols = list(source_cols)
+
+    if len(source_cols) != len(target_cols):
+        raise ValueError(f"Source column count ({len(source_cols)}) does not match target column count ({len(target_cols)}).")
+
+    return source_cols, target_cols
+
+def update_columns(source_path: str, key_column: Union[str, List[str]], update_cols: Union[str, List[str]],
                    target_path: str, target_key_column: Union[str, List[str]] = None,
+                   target_update_cols: Union[str, List[str]] = None,
                    output_dir: str = None, in_place: bool = False,
                    sheet_name: Union[str, int, None] = 0):
     """
     Match target file(s) with reference source_path on single or composite key_column(s) and update update_cols.
+    Supports separate or colon-separated mapping for source and target comparing (key) and updatable columns.
     """
     if not os.path.exists(source_path):
         print(f"ERROR: Source file not found: {source_path}", file=sys.stderr)
@@ -166,33 +211,26 @@ def update_columns(source_path: str, key_column: Union[str, List[str]], update_c
         print(f"ERROR: Target file/folder not found: {target_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Normalize key_column argument to list of strings
-    if isinstance(key_column, str):
-        raw_key_list = [k.strip() for k in key_column.split(",") if k.strip()]
-    else:
-        raw_key_list = [str(k).strip() for k in key_column if str(k).strip()]
+    try:
+        raw_source_keys, raw_target_keys = parse_column_pairs(key_column, target_key_column)
+    except Exception as e:
+        print(f"ERROR: Invalid comparing (key) column configuration: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    # Normalize target_key_column argument to list of strings
-    if target_key_column:
-        if isinstance(target_key_column, str):
-            raw_target_key_list = [k.strip() for k in target_key_column.split(",") if k.strip()]
-        else:
-            raw_target_key_list = [str(k).strip() for k in target_key_column if str(k).strip()]
-    else:
-        raw_target_key_list = raw_key_list
-
-    if len(raw_target_key_list) != len(raw_key_list):
-        print(f"ERROR: Number of target key columns ({len(raw_target_key_list)}) does not match source key columns ({len(raw_key_list)}).", file=sys.stderr)
+    try:
+        raw_source_u_cols, raw_target_u_cols = parse_column_pairs(update_cols, target_update_cols)
+    except Exception as e:
+        print(f"ERROR: Invalid updatable column configuration: {e}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Reading reference file: {source_path}...")
     df_source = load_file(source_path, sheet_name=sheet_name)
 
-    # Validate key_column(s) in source
+    # Validate source key column(s) in source
     cols_lower_source = {str(c).strip().lower(): c for c in df_source.columns}
     clean_source_keys = []
     missing_source_keys = []
-    for k in raw_key_list:
+    for k in raw_source_keys:
         matched = cols_lower_source.get(k.lower())
         if matched:
             clean_source_keys.append(matched)
@@ -205,18 +243,17 @@ def update_columns(source_path: str, key_column: Union[str, List[str]], update_c
         sys.exit(1)
 
     # Validate update_cols in source
-    clean_update_cols = []
+    clean_source_u_cols = []
     missing_cols = []
-    for col in update_cols:
-        col_strip = col.strip()
-        matched = cols_lower_source.get(col_strip.lower())
+    for col in raw_source_u_cols:
+        matched = cols_lower_source.get(col.lower())
         if matched:
-            clean_update_cols.append(matched)
+            clean_source_u_cols.append(matched)
         else:
-            missing_cols.append(col_strip)
+            missing_cols.append(col)
 
     if missing_cols:
-        print(f"ERROR: Update column(s) {missing_cols} not found in source file.", file=sys.stderr)
+        print(f"ERROR: Source update column(s) {missing_cols} not found in source file.", file=sys.stderr)
         print(f"Available columns in source: {list(df_source.columns)}", file=sys.stderr)
         sys.exit(1)
 
@@ -225,10 +262,10 @@ def update_columns(source_path: str, key_column: Union[str, List[str]], update_c
     df_source_clean['_norm_key'] = build_norm_key(df_source_clean, clean_source_keys)
     df_source_clean = df_source_clean.drop_duplicates(subset=['_norm_key'], keep='first')
 
-    # Build mapping dictionary for each update column
+    # Build mapping dictionary for each source update column
     mappings: Dict[str, dict] = {}
-    for ucol in clean_update_cols:
-        mappings[ucol] = dict(zip(df_source_clean['_norm_key'], df_source_clean[ucol]))
+    for src_ucol in clean_source_u_cols:
+        mappings[src_ucol] = dict(zip(df_source_clean['_norm_key'], df_source_clean[src_ucol]))
 
     # Locate target files
     target_files = []
@@ -273,7 +310,7 @@ def update_columns(source_path: str, key_column: Union[str, List[str]], update_c
         t_cols_lower = {str(c).strip().lower(): c for c in df_target.columns}
         clean_target_keys = []
         missing_t_keys = []
-        for tk in raw_target_key_list:
+        for tk in raw_target_keys:
             t_matched = t_cols_lower.get(tk.lower())
             if t_matched:
                 clean_target_keys.append(t_matched)
@@ -281,21 +318,47 @@ def update_columns(source_path: str, key_column: Union[str, List[str]], update_c
                 missing_t_keys.append(tk)
 
         if missing_t_keys:
-            print(f"WARNING: Key column(s) {missing_t_keys} not found in '{t_name}'. Skipping.", file=sys.stderr)
+            print(f"WARNING: Comparing key column(s) {missing_t_keys} not found in '{t_name}'. Skipping.", file=sys.stderr)
             continue
 
         # Create normalized target composite key for matching
         t_norm_key = build_norm_key(df_target, clean_target_keys)
 
+        # Build fuzzy key resolver
+        source_norm_keys = list(df_source_clean['_norm_key'].unique())
+        fuzzy_key_map = {}
+        neg_words = {'unknown', 'unassigned', 'none', 'null', 'nan', 'unmatched', 'missing'}
+
+        def resolve_key(tk):
+            if not tk or pd.isna(tk):
+                return tk
+            tk_str = str(tk).strip()
+            if not tk_str or tk_str in df_source_clean['_norm_key'].values:
+                return tk_str
+            if tk_str in fuzzy_key_map:
+                return fuzzy_key_map[tk_str]
+            close = difflib.get_close_matches(tk_str, source_norm_keys, n=1, cutoff=0.80)
+            if close:
+                cand = close[0]
+                val_neg = any(w in tk_str for w in neg_words)
+                cand_neg = any(w in cand for w in neg_words)
+                res = cand if (val_neg == cand_neg) else tk_str
+            else:
+                res = tk_str
+            fuzzy_key_map[tk_str] = res
+            return res
+
+        t_norm_key_resolved = t_norm_key.apply(resolve_key)
+
         # Count row matches
-        matched_rows_count = t_norm_key.isin(df_source_clean['_norm_key']).sum()
+        matched_rows_count = t_norm_key_resolved.isin(df_source_clean['_norm_key']).sum()
 
         # Update or insert columns
-        for ucol in clean_update_cols:
-            mapped_series = t_norm_key.map(mappings[ucol])
+        for src_ucol, tgt_ucol_name in zip(clean_source_u_cols, raw_target_u_cols):
+            mapped_series = t_norm_key_resolved.map(mappings[src_ucol])
             
-            # Check if ucol already exists in target (case & whitespace insensitive)
-            existing_t_col = t_cols_lower.get(str(ucol).strip().lower())
+            # Check if target update column already exists in target (case & whitespace insensitive)
+            existing_t_col = t_cols_lower.get(str(tgt_ucol_name).strip().lower())
             if existing_t_col:
                 m_ser = mapped_series.astype(object)
                 t_ser = df_target[existing_t_col].astype(object)
@@ -306,8 +369,8 @@ def update_columns(source_path: str, key_column: Union[str, List[str]], update_c
                 res = pd.Series(np.where(m_missing, t_ser, m_ser), index=df_target.index)
                 df_target[existing_t_col] = res
             else:
-                # Insert as new column
-                df_target[ucol] = mapped_series
+                # Insert as new column with target update column name
+                df_target[tgt_ucol_name] = mapped_series
 
         # Determine output file path
         if in_place:
@@ -337,24 +400,29 @@ def main():
         help="Path to reference lookup Excel/CSV file (e.g. Agent_data.xlsx)."
     )
     parser.add_argument(
-        "-k", "--key",
+        "-k", "--key", "--source-key",
         required=True,
-        help="Comma-separated key column name(s) to match on in reference file (e.g. 'Policy No, Agent Name')."
+        help="Source key column(s) to match on in reference file. Can use 'SourceCol:TargetCol' format or comma-separated names (e.g. 'Policy No:Policy Number' or 'Agent Name')."
     )
     parser.add_argument(
-        "-u", "--update-cols",
+        "--target-key", "--tk",
+        default=None,
+        help="Target comparing key column(s) in target file(s) if different from --key."
+    )
+    parser.add_argument(
+        "-u", "--update-cols", "--source-update-cols",
         required=True,
-        help="Comma-separated list of column(s) from reference file to update/add in target files (e.g. 'Carrier, Agent ID')."
+        help="Source updatable column(s) from reference file. Can use 'SourceCol:TargetCol' format or comma-separated names (e.g. 'Agent ID:Agent Code' or 'Carrier')."
+    )
+    parser.add_argument(
+        "--target-update-cols", "--target-u", "--tu",
+        default=None,
+        help="Target updating column(s) in target file(s) to update/add if different from --update-cols."
     )
     parser.add_argument(
         "-t", "--target",
         required=True,
         help="Path to a target file OR folder containing target Excel/CSV files."
-    )
-    parser.add_argument(
-        "--target-key",
-        default=None,
-        help="Comma-separated key column name(s) in target file(s) if different from --key. Defaults to --key."
     )
     parser.add_argument(
         "-o", "--output-dir",
@@ -374,8 +442,6 @@ def main():
 
     args = parser.parse_args()
 
-    update_list = [c.strip() for c in args.update_cols.split(",") if c.strip()]
-
     sheet = args.sheet
     if isinstance(sheet, str) and sheet.isdigit():
         sheet = int(sheet)
@@ -383,9 +449,10 @@ def main():
     update_columns(
         source_path=args.source,
         key_column=args.key,
-        update_cols=update_list,
+        update_cols=args.update_cols,
         target_path=args.target,
         target_key_column=args.target_key,
+        target_update_cols=args.target_update_cols,
         output_dir=args.output_dir,
         in_place=args.in_place,
         sheet_name=sheet
@@ -393,4 +460,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

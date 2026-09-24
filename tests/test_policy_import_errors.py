@@ -158,6 +158,46 @@ class TestPolicyImportErrors(unittest.TestCase):
         self.assertEqual(err_res.iloc[0]["Policy No"], "POL102")
         self.assertEqual(err_res.iloc[0]["Error"], "Agent ID not matched")
 
+    def test_fuzzy_agent_name_matching(self):
+        base_df = pd.DataFrame({
+            "Policy No": ["POL501"],
+            "Agent Name": ["Grek Teipal"],
+            "Agent ID": [None]
+        })
+        base_path = os.path.join(self.test_dir, "fuzzy_base.xlsx")
+        base_df.to_excel(base_path, index=False)
+
+        master_df = pd.DataFrame({
+            "Policy Number": ["POL501"],
+            "Agent Name": ["Grek Teipal"],
+            "Carrier": ["Aetna"]
+        })
+        master_path = os.path.join(self.test_dir, "fuzzy_master.xlsx")
+        master_df.to_excel(master_path, index=False)
+
+        ref_df = pd.DataFrame({
+            "Agent Name": ["Greg  Teipel"],
+            "Agent ID": ["8307933"]
+        })
+        ref_path = os.path.join(self.test_dir, "fuzzy_roster.xlsx")
+        ref_df.to_excel(ref_path, index=False)
+
+        out_path = os.path.join(self.test_dir, "fuzzy_out.xlsx")
+        err_path = os.path.join(self.test_dir, "fuzzy_err.xlsx")
+
+        enrich_policy_data_with_errors(
+            base_file_path=base_path,
+            master_file_path=master_path,
+            output_file_path=out_path,
+            error_file_path=err_path,
+            ref_file_path=ref_path
+        )
+
+        clean_res = pd.read_excel(out_path)
+        self.assertEqual(len(clean_res), 1)
+        self.assertEqual(str(clean_res.iloc[0]["Agent ID"]), "8307933")
+
 
 if __name__ == "__main__":
     unittest.main()
+

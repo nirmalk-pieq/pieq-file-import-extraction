@@ -12,6 +12,7 @@ when zero errors are found, or prompts the user interactively when errors exist.
 """
 
 import argparse
+import difflib
 import os
 import sys
 import time
@@ -122,18 +123,48 @@ def apply_reference_updates(
     total_updated = 0
     updated_col_names = []
 
+    ref_keys_list = list(ref_clean["_norm_key"].unique())
+    fuzzy_cache = {}
+    neg_words = {'unknown', 'unassigned', 'none', 'null', 'nan', 'unmatched', 'missing'}
+
+    def resolve_key(k):
+        if not k or pd.isna(k):
+            return None
+        k_str = str(k).strip()
+        if not k_str:
+            return None
+        if k_str in ref_keys_list:
+            return k_str
+        if k_str in fuzzy_cache:
+            return fuzzy_cache[k_str]
+        close = difflib.get_close_matches(k_str, ref_keys_list, n=1, cutoff=0.80)
+        if close:
+            cand = close[0]
+            val_neg = any(w in k_str for w in neg_words)
+            cand_neg = any(w in cand for w in neg_words)
+            res = cand if (val_neg == cand_neg) else None
+        else:
+            res = None
+        fuzzy_cache[k_str] = res
+        return res
+
+    df_norm_key_resolved = df_norm_key.apply(resolve_key)
+
     for r_v_col, d_t_col in cols_to_update:
         mapping_dict = dict(zip(ref_clean["_norm_key"], ref_clean[r_v_col]))
-        mapped_series = df_norm_key.map(mapping_dict)
+        mapped_series = df_norm_key_resolved.map(mapping_dict)
 
         updated_count = int(mapped_series.notna().sum())
         total_updated = max(total_updated, updated_count)
 
-        df[d_t_col] = mapped_series
+        if d_t_col in df.columns:
+            df[d_t_col] = df[d_t_col].astype(object)
+            df[d_t_col] = mapped_series.combine_first(df[d_t_col])
+        else:
+            df[d_t_col] = mapped_series
         updated_col_names.append(d_t_col)
 
-    ref_keys_set = set(ref_clean["_norm_key"])
-    df["_ref_agent_matched"] = df_norm_key.isin(ref_keys_set)
+    df["_ref_agent_matched"] = df_norm_key_resolved.notna()
 
     print(f" Done ({total_updated:,} record(s) updated in {updated_col_names})")
     return df
@@ -707,7 +738,7 @@ def run_pipeline_steps_2_and_3(
 
     # --- Step 2: Commission Split Calculation & Agent Level Enrichment ---
     print("\n--- [STEP 2/3] Commission Split Calculation & Agent Level Enrichment ---")
-    enrich_script = os.path.join(script_dir, "enrich_policy_commission_import.py")
+    enrich_script = os.path.join(script_dir, "..", "policy", "enrich_policy_commissions.py")
     step2_args = [
         sys.executable,
         enrich_script,
@@ -734,7 +765,7 @@ def run_pipeline_steps_2_and_3(
     # --- Step 3: Carrier Splitting ---
     if not no_splits:
         print("\n--- [STEP 3/3] Carrier Splitting (Clean Policy Import File) ---")
-        split_script = os.path.join(script_dir, "split_file.py")
+        split_script = os.path.join(script_dir, "..", "utils", "split_file.py")
         step3_args = [
             sys.executable,
             split_script,

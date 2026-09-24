@@ -128,6 +128,7 @@ def apply_reference_updates(
         total_updated = max(total_updated, updated_count)
 
         if d_t_col in df.columns:
+            df[d_t_col] = df[d_t_col].astype(object)
             df[d_t_col] = mapped_series.combine_first(df[d_t_col])
         else:
             df[d_t_col] = mapped_series

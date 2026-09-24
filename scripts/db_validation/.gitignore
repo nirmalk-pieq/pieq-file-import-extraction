@@ -1,0 +1,13 @@
+# Virtual environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Excel / Temporary files
+~$*.xlsx
+*.log
+
+# Pipeline outputs
+pipeline_output/
+*.xlsx

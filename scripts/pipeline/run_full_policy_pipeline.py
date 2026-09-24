@@ -124,6 +124,17 @@ def main():
         action="store_true",
         help="Auto-confirm prompt and proceed to next steps without stopping.",
     )
+    parser.add_argument(
+        "--validate-commission",
+        action="store_true",
+        help="Cross-verify extracted commission values against ProductWise Commission Rate master file after Step 2.",
+    )
+    parser.add_argument(
+        "--product-commission-file",
+        type=str,
+        default="tests/ProductWise Commission Rate.xlsx",
+        help="Path to ProductWise Commission Rate excel file for validation (default: tests/ProductWise Commission Rate.xlsx).",
+    )
 
     args = parser.parse_args()
 
@@ -135,6 +146,7 @@ def main():
     step1_out = os.path.join(args.output_dir, "Policy_List_Enriched.xlsx")
     comm_import_dir = os.path.join(args.output_dir, "commission_import")
     split_dir = os.path.join(args.output_dir, "split_policy")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
 
     start_time = time.time()
     print("==========================================================================")
@@ -143,7 +155,7 @@ def main():
 
     # --- Step 1: Bulk Policy List Enrichment & Validation ---
     print("\n--- [STEP 1/3] Bulk Policy List Enrichment & Validation ---")
-    step1_script = "update_policy_import_with_validation.py" if (args.export_errors or args.error_file) else "update_policy_import.py"
+    step1_script = os.path.join(script_dir, "import_policy_list_with_validation.py") if (args.export_errors or args.error_file) else os.path.join(script_dir, "..", "policy", "enrich_policies_with_master_data.py")
     step1_args = [
         sys.executable,
         step1_script,
@@ -192,7 +204,7 @@ def main():
     print("\n--- [STEP 2/3] Commission Split Calculation & Agent Level Enrichment ---")
     step2_args = [
         sys.executable,
-        "enrich_policy_commission_import.py",
+        os.path.join(script_dir, "..", "policy", "enrich_policy_commissions.py"),
         "--base-file", args.base_split,
         "--master-file", step1_out,  # Use step 1 output as lookup!
         "--output-dir", comm_import_dir
@@ -212,12 +224,28 @@ def main():
             step2_args.extend(["--ref-target-col", args.ref_target_col])
     run_cmd(step2_args)
 
+    # --- Step 2.5: Optional Commission Extraction Validation ---
+    if args.validate_commission:
+        print("\n--- [STEP 2.5] Cross-Verifying Extracted Commission Values ---")
+        comm_val_dir = os.path.join(args.output_dir, "commission_validation")
+        val_input = step2_out if (not os.path.isdir(args.base_split) and 'step2_out' in locals()) else comm_import_dir
+        val_args = [
+            sys.executable,
+            os.path.join(script_dir, "..", "commission", "validate_commissions.py"),
+            "--commission-input", val_input,
+            "--product-commission-file", args.product_commission_file,
+            "--output-dir", comm_val_dir
+        ]
+        if os.path.exists("Final Product Normalization Local.xlsx"):
+            val_args.extend(["--norm-file", "Final Product Normalization Local.xlsx"])
+        run_cmd(val_args)
+
     # --- Step 3: Split Policy List (Step 1 Output) by Carrier ---
     if not args.no_splits:
         print("\n--- [STEP 3/3] Carrier Splitting (Policy Import File) ---")
         step3_args = [
             sys.executable,
-            "split_file.py",
+            os.path.join(script_dir, "..", "utils", "split_file.py"),
             "--file", step1_out,
             "--column", args.split_col,
             "--output-dir", split_dir,

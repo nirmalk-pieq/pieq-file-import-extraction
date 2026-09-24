@@ -256,6 +256,58 @@ class TestFileSplitter(unittest.TestCase):
         self.assertEqual(res1.iloc[0]["Agent ID"], "AG101")
         self.assertEqual(res2.iloc[0]["Agent ID"], "AG102")
 
+    def test_update_columns_mapped_names(self):
+        # Reference source file with "Ref Agent" and "Ref Code"
+        df_source = pd.DataFrame({
+            "Ref Agent": ["Alice", "Bob"],
+            "Ref Code": ["AC100", "AC200"]
+        })
+        source_csv = os.path.join(self.test_dir, "Ref_data.csv")
+        df_source.to_csv(source_csv, index=False)
+
+        # Target file with "Target Agent" and missing "Target Code"
+        df_target = pd.DataFrame({
+            "Target Agent": ["Bob", "Alice"],
+            "Policy": ["P100", "P200"]
+        })
+        target_csv = os.path.join(self.test_dir, "Target_data.csv")
+        df_target.to_csv(target_csv, index=False)
+
+        output_dir = os.path.join(self.test_dir, "mapped_output")
+
+        # Test colon format: key_column="Ref Agent:Target Agent", update_cols="Ref Code:Target Code"
+        update_columns(
+            source_path=source_csv,
+            key_column="Ref Agent:Target Agent",
+            update_cols="Ref Code:Target Code",
+            target_path=target_csv,
+            output_dir=output_dir
+        )
+
+        res_path = os.path.join(output_dir, "Target_data_updated.csv")
+        self.assertTrue(os.path.exists(res_path))
+        df_res = pd.read_csv(res_path)
+        self.assertIn("Target Code", df_res.columns)
+        self.assertEqual(df_res["Target Code"].tolist(), ["AC200", "AC100"])
+
+        # Test explicit target parameters: key_column="Ref Agent", target_key_column="Target Agent", update_cols="Ref Code", target_update_cols="Target Code"
+        output_dir2 = os.path.join(self.test_dir, "mapped_output2")
+        update_columns(
+            source_path=source_csv,
+            key_column="Ref Agent",
+            target_key_column="Target Agent",
+            update_cols="Ref Code",
+            target_update_cols="Target Code",
+            target_path=target_csv,
+            output_dir=output_dir2
+        )
+
+        res_path2 = os.path.join(output_dir2, "Target_data_updated.csv")
+        self.assertTrue(os.path.exists(res_path2))
+        df_res2 = pd.read_csv(res_path2)
+        self.assertIn("Target Code", df_res2.columns)
+        self.assertEqual(df_res2["Target Code"].tolist(), ["AC200", "AC100"])
+
     def test_calculate_month_range_logic(self):
         from datetime import datetime
         ref_date = datetime(2026, 7, 24)
