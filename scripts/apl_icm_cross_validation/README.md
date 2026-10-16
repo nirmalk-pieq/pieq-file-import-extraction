@@ -19,11 +19,35 @@ The top of the script contains `Enum` blocks which define exactly which columns 
 If you ever need to use `Gross Commission` instead of `Earned Commission`, you can easily change it there without editing the core logic!
 
 ### Execution
-Run the script natively using Python. It will interactively prompt you for the paths to the **two** input files:
+Run the script with the APL statement and the forecast `commission_detail_report.csv`:
+
 ```bash
-cd apl_icm_cross_validation
-python3 validate_apl_icm.py
+cd scripts/apl_icm_cross_validation
+python3 validate_apl_icm.py \
+  --apl /path/to/APL_statement.csv \
+  --parallel /path/to/forecase_scripts/forecast-out/<statement-uuid>/commission_detail_report.csv \
+  --mode apl
 ```
+
+Example:
+
+```bash
+python3 validate_apl_icm.py \
+  --apl versions/v6/input/APL_PR_7.CSV.csv \
+  --parallel ../../forecase_scripts/forecast-out/a326dd09-c5a6-4140-8eff-d8a7b0cfb784/commission_detail_report.csv \
+  --mode apl
+```
+
+`--mode` chooses which file drives the primary comparison loop:
+
+- `apl` — APL -> ICM (one output row per APL record; orphaned ICM rows are extras)
+- `icm` — ICM -> APL (one output row per ICM/payable record; orphaned APL rows are extras)
+
+If `--mode` is omitted, the script prompts for it. The forecast runner always passes mode from `APL_VALIDATION_MODE` (default `apl`) so batch runs stay non-interactive.
+
+The forecast file is the ICM payables side. It is matched on `policy_number`, `Agent Name`, `product_name`, and `commission_amount`.
+
+Without `--apl` / `--parallel` the script still asks for both paths.
 
 ### Outputs & Versioning
 When the script runs, it automatically creates a new versioned folder (e.g., `versions/v1/`, `versions/v2/`) within the `apl_icm_cross_validation` directory.
