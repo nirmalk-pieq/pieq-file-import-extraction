@@ -51,24 +51,28 @@ def main():
             clean_url = db_url.strip()
             if clean_url.lower().startswith("jdbc:"):
                 clean_url = clean_url[5:]
-            conn_kwargs = {"dsn": clean_url}
+            conn_kwargs = {"dsn": clean_url, "connect_timeout": 5}
             if db_user:
                 conn_kwargs["user"] = db_user
             if db_password:
                 conn_kwargs["password"] = db_password
+            print("🔌 Connecting to PostgreSQL database...", flush=True)
             db_conn = psycopg2.connect(**conn_kwargs)
         else:
+            print("🔌 Connecting to PostgreSQL database...", flush=True)
             db_conn = psycopg2.connect(
                 host=os.environ.get("DB_HOST", "localhost"),
                 port=os.environ.get("DB_PORT", "5432"),
                 dbname=os.environ.get("DB_NAME", "postgres"),
                 user=db_user or "postgres",
-                password=db_password or ""
+                password=db_password or "",
+                connect_timeout=5
             )
         db_conn.autocommit = True
         cursor = db_conn.cursor(cursor_factory=RealDictCursor)
+        print("🟢 Connected to PostgreSQL database successfully.", flush=True)
     except Exception as e:
-        print(f"Failed to connect to database: {e}")
+        print(f"❌ Failed to connect to database: {e}", flush=True)
         return
 
     with open(args.file, "r") as f:
