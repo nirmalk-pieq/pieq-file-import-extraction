@@ -34,6 +34,7 @@ import functools
 import math
 import os
 import re
+import shutil
 import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple, Union
@@ -58,6 +59,36 @@ except ImportError:
         for row in data:
             lines.append("| " + " | ".join(str(v) for v in row) + " |")
         return "\n".join(lines)
+
+
+def are_codes_matching(code1: str, code2: str) -> bool:
+    """Check if two agent user codes are equivalent, ignoring suffixes like AV6old, SL, OVR, etc."""
+    if not code1 or not code2:
+        return False
+    c1 = str(code1).strip().lower()
+    c2 = str(code2).strip().lower()
+    if c1 == c2:
+        return True
+    if c1.startswith(c2) or c2.startswith(c1) or c1 in c2 or c2 in c1:
+        return True
+    d1 = re.sub(r'[^0-9]', '', c1)
+    d2 = re.sub(r'[^0-9]', '', c2)
+    if d1 and d2 and len(d1) >= 4 and len(d2) >= 4 and d1 == d2:
+        return True
+    return False
+
+
+def are_names_matching(name1: str, name2: str) -> bool:
+    """Check if two agent names match, collapsing extra whitespace and normalizing case & aliases."""
+    if not name1 or not name2:
+        return False
+    n1 = " ".join(str(name1).lower().split())
+    n2 = " ".join(str(name2).lower().split())
+    if n1 == n2:
+        return True
+    if ("main line" in n1 or "mlb" in n1) and ("main line" in n2 or "mlb" in n2):
+        return True
+    return False
 
 
 
@@ -132,6 +163,70 @@ def clean_key(series: pd.Series) -> pd.Series:
     )
 
 
+def clean_agent_code(val: str) -> str:
+    """Cleans an agent code / user_code value:
+    - Strips leading/trailing whitespace and leading quote characters (e.g. '21758900 -> 21758900).
+    - Removes any trailing non-numeric alphabetic suffix (e.g. 21758900SL -> 21758900).
+    """
+    if not val:
+        return val
+    # Strip whitespace
+    v = str(val).strip()
+    # Remove leading quote characters (', ")
+    v = v.lstrip("'\"")
+    # Remove trailing alphabetic-only suffix (e.g. SL, SL1 not stripped; only pure alpha like SL)
+    import re as _re
+    v = _re.sub(r'[A-Za-z]+$', '', v).strip()
+    return v
+
+
+def policy_suffix_candidates(policy_number: str) -> List[str]:
+    """Alternate policy numbers to try when the full number is not in the policies table.
+
+    Tries, in order:
+    - trailing alphabetic suffix removed (OVR, SL, and any other trailing letters)
+    - short letter-led suffix removed (A8, K1, K67)
+    - a single trailing character removed
+    """
+    pol = str(policy_number or "").strip().strip("'\"").strip()
+    if not pol or pol.lower() == "nan":
+        return []
+
+    found: List[str] = []
+
+    def add(value: str) -> None:
+        value = str(value or "").strip()
+        if value and value != pol and value not in found:
+            found.append(value)
+
+    # Trailing letters, including a multi-letter suffix such as OVR or a single letter.
+    add(re.sub(r"[A-Za-z]+$", "", pol))
+    # Letter plus digits left on the end of a numeric policy number, such as A8, K1, or K67.
+    token_stripped = re.sub(r"[A-Za-z]\d{1,3}$", "", pol)
+    if token_stripped.isdigit() and len(token_stripped) >= 6:
+        add(token_stripped)
+    # One trailing character, only when the value is not already a plain numeric policy number.
+    if len(pol) > 1 and not pol.isdigit():
+        add(pol[:-1])
+    return found
+
+
+def lookup_policy_db_records(chunk_db_map: dict, policy_number: str, clean_prod_name: str) -> list:
+    """Return bulk-fetched policy rows for an exact policy number, preferring the product match."""
+    db_records = chunk_db_map.get((policy_number, clean_prod_name), [])
+    if db_records:
+        return db_records
+    pol_records = chunk_db_map.get(policy_number, [])
+    filtered = [
+        r for r in pol_records
+        if clean_prod_name in " ".join(str(r.get("product_name", "")).lower().split())
+        or " ".join(str(r.get("product_name", "")).lower().split()) in clean_prod_name
+    ]
+    if filtered:
+        return filtered
+    return list(pol_records) if pol_records else []
+
+
 def parse_amount(val) -> float:
     """Parses currency strings or numeric values into float."""
     if pd.isna(val):
@@ -146,14 +241,22 @@ def parse_amount(val) -> float:
 
 
 def parse_rate(val) -> float:
-    """Parses percentage strings or numeric values into float percentage scale (e.g. 70.0)."""
+    """Parses percentage strings or numeric values into float percentage scale (e.g. 70.0).
+    Handles Excel percentage cell formatting where 125% is read as float 1.25.
+    """
     if pd.isna(val):
         return 0.0
-    val_str = str(val).strip().replace("%", "").strip()
+    val_str = str(val).strip()
+    has_pct = "%" in val_str
+    val_str = val_str.replace("%", "").strip()
     if not val_str:
         return 0.0
     try:
         v = float(val_str)
+        # Excel stores percentage formats as decimal fractions (1.0 = 100%, 1.25 = 125%, 0.70 = 70%).
+        # If the original string did NOT have an explicit '%' sign and 0 < v <= 2.5, scale up to percentage (0-100+).
+        if not has_pct and 0 < v <= 2.5:
+            v = round(v * 100.0, 4)
         return v
     except ValueError:
         return 0.0
@@ -194,11 +297,14 @@ def load_file(file_path: str) -> pd.DataFrame:
                 if ext in (".csv", ".xlsx", ".xls"):
                     full_p = os.path.join(root, f)
                     try:
-                        dfs.append(load_file(full_p))
+                        frame = load_file(full_p)
+                        print(f"📄 Reading '{full_p}' ({len(frame):,} rows)")
+                        dfs.append(frame)
                     except Exception as err:
                         print(f"⚠️ Warning: Could not read file '{full_p}': {err}")
         if not dfs:
             raise ValueError(f"No valid CSV or Excel files found in directory '{file_path}'.")
+        print(f"📄 Combined {len(dfs)} file(s) from '{file_path}'.")
         return pd.concat(dfs, ignore_index=True)
 
     _, ext = os.path.splitext(file_path.lower())
@@ -208,6 +314,34 @@ def load_file(file_path: str) -> pd.DataFrame:
         return pd.read_csv(file_path, low_memory=False)
     else:
         raise ValueError(f"Unsupported file format '{ext}' for file '{file_path}'.")
+
+
+def archive_upload_input(src_path: str, dest_dir: str) -> None:
+    """Copy the upload file, or every spreadsheet in an upload folder, into the run input folder."""
+    if not os.path.isdir(src_path):
+        shutil.copy2(src_path, os.path.join(dest_dir, os.path.basename(src_path)))
+        return
+
+    copied = 0
+    for root, _, files in os.walk(src_path):
+        for name in sorted(files):
+            if name.startswith("~$") or name.startswith("."):
+                continue
+            ext = os.path.splitext(name.lower())[1]
+            if ext not in (".csv", ".xlsx", ".xls"):
+                continue
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, src_path)
+            dest = os.path.join(dest_dir, rel)
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            shutil.copy2(full, dest)
+            copied += 1
+    if copied == 0:
+        print(f"⚠️ No spreadsheet files archived from '{src_path}'.")
+    else:
+        print(f"📁 Archived {copied} input file(s) from the upload folder.")
 
 
 def load_product_normalization(norm_path: str = None) -> Dict[str, str]:
@@ -569,6 +703,7 @@ def stage1_pre_validate_dataset(
         seq_1_idx = indices[0]
         seq_1_row = group.loc[seq_1_idx]
 
+        pol_val = str(seq_1_row.get(pol_col, "")).strip() if pol_col else ""
         raw_prod = str(seq_1_row.get(prod_col, "")).strip()
         raw_fm = seq_1_row.get(fm_col, 1)
 
@@ -583,7 +718,15 @@ def stage1_pre_validate_dataset(
         elif norm_prod in norm_dict:
             final_norm_prod = norm_dict[norm_prod]
             clean_prod = " ".join(final_norm_prod.lower().split())
-            norm_prod = normalize_product_str(final_norm_prod)
+
+        if not pol_val or pol_val.lower() in ("nan", "none", "", "null"):
+            for idx in indices:
+                validation_statuses[idx] = "MISSING_POLICY_NUMBER"
+                error_reasons[idx] = "Policy number is missing/blank in input upload file."
+                expected_values[idx] = "Valid Policy Number"
+                variances[idx] = 0.0
+                normalized_product_names[idx] = final_norm_prod
+            continue
 
         for idx in indices:
             normalized_product_names[idx] = final_norm_prod
@@ -795,10 +938,11 @@ class DatabaseManager:
         self.port = port or int(os.getenv("DB_PORT", 5432))
         self.dbname = dbname or os.getenv("DB_NAME", "pieq_db")
         self.conn = None
+        self.user_display_by_uuid = {}
 
     def connect(self) -> bool:
         if not DB_DRIVER_AVAILABLE:
-            print("⚠️ Notice: psycopg2 driver not installed. Database verification running in DRY-RUN mode.")
+            print("⚠️ Notice: psycopg2 driver not installed. Database verification running in DRY-RUN mode.", flush=True)
             return False
 
         try:
@@ -807,7 +951,7 @@ class DatabaseManager:
                 clean_url = str(self.db_url).strip()
                 if clean_url.lower().startswith("jdbc:"):
                     clean_url = clean_url[5:]
-                conn_kwargs = {"dsn": clean_url}
+                conn_kwargs = {"dsn": clean_url, "connect_timeout": 5, "options": "-c statement_timeout=180000"}
                 if self.user:
                     conn_kwargs["user"] = self.user
                 if self.password:
@@ -819,11 +963,13 @@ class DatabaseManager:
                 log_db = db_match.group(1) if db_match else "db"
                 target_info = f"Host: '{log_host}', DB: '{log_db}', User: '{self.user or 'default'}'"
 
+                print(f"   🔌 Connecting to PostgreSQL ({target_info}) [Timeout: 5s]...", flush=True)
                 self.conn = psycopg2.connect(**conn_kwargs)
             else:
                 target_info = f"Host: '{self.host}:{self.port}', DB: '{self.dbname}', User: '{self.user}'"
+                print(f"   🔌 Connecting to PostgreSQL ({target_info}) [Timeout: 5s]...", flush=True)
                 self.conn = psycopg2.connect(
-                    host=self.host, port=self.port, dbname=self.dbname, user=self.user, password=self.password
+                    host=self.host, port=self.port, dbname=self.dbname, user=self.user, password=self.password, connect_timeout=5, options="-c statement_timeout=180000"
                 )
 
             self.conn.set_session(readonly=True, autocommit=True)
@@ -839,12 +985,12 @@ class DatabaseManager:
             except Exception:
                 pass
 
-            print(f"   🟢 Connected to PostgreSQL ({target_info})")
-            print(f"   ℹ️ Server Info: {db_version}")
+            print(f"   🟢 Connected to PostgreSQL ({target_info})", flush=True)
+            print(f"   ℹ️ Server Info: {db_version}", flush=True)
             return True
 
         except Exception as e:
-            print(f"   ❌ Could not connect to PostgreSQL database: {e}")
+            print(f"   ❌ Could not connect to PostgreSQL database: {e}", flush=True)
             self.conn = None
             return False
 
@@ -927,9 +1073,10 @@ class DatabaseManager:
         try:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
                 if user_code:
+                    clean_code = clean_agent_code(str(user_code))
                     cur.execute(
                         "SELECT uuid FROM users WHERE agency_id = %s AND (user_code = %s OR agent_id = %s) LIMIT 1;",
-                        (agency_id, str(user_code).strip(), str(user_code).strip())
+                        (agency_id, clean_code, clean_code)
                     )
                     row = cur.fetchone()
                     if row and row.get("uuid"):
@@ -961,6 +1108,7 @@ class DatabaseManager:
         if not self.conn:
             return {}
         user_map = {}
+        self.user_display_by_uuid = {}
         try:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
@@ -971,11 +1119,14 @@ class DatabaseManager:
                 cols = set(r["column_name"].lower() for r in cur.fetchall())
                 
                 code_col = "user_code" if "user_code" in cols else ("agent_id" if "agent_id" in cols else None)
+                display_code_col = code_col or ("code" if "code" in cols else None)
                 name_col = "name" if "name" in cols else ("full_name" if "full_name" in cols else ("user_name" if "user_name" in cols else None))
                 
                 select_cols = ["uuid"]
                 if code_col:
                     select_cols.append(code_col)
+                elif display_code_col:
+                    select_cols.append(display_code_col)
                 if name_col:
                     select_cols.append(name_col)
                     
@@ -983,7 +1134,7 @@ class DatabaseManager:
                 cur.execute(query, (agency_id,))
                 rows = cur.fetchall()
                 for r in rows:
-                    u_uuid = str(r.get("uuid", ""))
+                    u_uuid = str(r.get("uuid", "")).strip()
                     if not u_uuid:
                         continue
                     if code_col and r.get(code_col):
@@ -994,6 +1145,12 @@ class DatabaseManager:
                         n_val = " ".join(str(r[name_col]).strip().lower().split())
                         if n_val:
                             user_map[n_val] = u_uuid
+                    display = self.user_display_by_uuid.setdefault(u_uuid.lower(), {"name": "", "code": ""})
+                    raw_code = r.get(display_code_col) if display_code_col else None
+                    if raw_code and not display["code"]:
+                        display["code"] = str(raw_code).strip()
+                    if name_col and r.get(name_col) and not display["name"]:
+                        display["name"] = " ".join(str(r[name_col]).strip().split())
                             
                 # Query contacts table for fallback mappings (concat first_name + last_name -> relationship_id)
                 try:
@@ -1012,68 +1169,171 @@ class DatabaseManager:
                         full = " ".join(f"{fname} {lname}".lower().split())
                         if full and full not in user_map:
                             user_map[full] = rel_id
+                        full_display = " ".join(f"{fname} {lname}".split())
+                        if full_display:
+                            display = self.user_display_by_uuid.setdefault(rel_id.lower(), {"name": "", "code": ""})
+                            display["name"] = full_display
                 except Exception as ce:
                     pass
         except Exception as e:
             print(f"⚠️ Warning: Could not fetch user map from database: {e}")
         return user_map
 
-    def fetch_all_agency_commission_rules(self, agency_id: int) -> Dict[Union[str, Tuple[str, str]], List[dict]]:
+    def format_writing_agent(self, writing_agent_user_id) -> str:
+        """Display name for policies.writing_agent_user_id, from contacts then users."""
+        uid = str(writing_agent_user_id or "").strip()
+        if not uid or uid.lower() in ("none", "null"):
+            return ""
+        info = self.user_display_by_uuid.get(uid.lower(), {})
+        name = str(info.get("name") or "").strip()
+        code = str(info.get("code") or "").strip()
+        if name and code:
+            return f"{name} (Code: {code})"
+        return name or (f"(Code: {code})" if code else "")
+
+    def fetch_all_agency_commission_rules(self, agency_id: int, policy_numbers: Optional[List[str]] = None) -> Dict[Union[str, Tuple[str, str]], List[dict]]:
         """
-        Executes a SINGLE SQL query to pre-fetch ALL products, policies, and policy_commission rules
-        for the entire agency into an in-memory lookup map for zero-latency Stage 2 verification.
+        Executes two fast, indexed SQL queries to pre-fetch:
+        1) Products & policies for the specified policy numbers (or entire agency).
+        2) Matching policy_commission rules.
+        Merges them in memory to eliminate Cartesian join bloat and complete in sub-second time.
         """
         if not self.conn:
             return {}
         result_map = {}
         try:
+            clean_pols = [str(p).strip() for p in policy_numbers if str(p).strip()] if policy_numbers else []
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-                query = """
-                    SELECT 
-                        p.uuid AS product_uuid,
-                        p.name AS product_name,
-                        pol.uuid AS policy_uuid,
-                        pol.number AS policy_number,
-                        pol.writing_agent_user_id,
-                        pol.pay_to_agent_user_id,
-                        pc.uuid AS commission_uuid,
-                        pc.rule_name,
-                        pc.commission_type,
-                        pc.payment_frequency,
-                        pc.month_from,
-                        pc.month_to,
-                        pc.payout_method,
-                        pc.fee_amount,
-                        pc.premium_amount,
-                        pc.commission_split
-                    FROM products p
-                    JOIN policies pol ON (pol.agency_id = p.agency_id AND pol.product_id::text = p.uuid::text)
-                    LEFT JOIN policy_commission pc ON (pc.agency_id = p.agency_id AND pc.policy_uuid::text = pol.uuid::text)
-                    WHERE p.agency_id = %s
-                      AND pol.agency_id = %s;
-                """
-                cur.execute(query, (agency_id, agency_id))
-                rows = cur.fetchall()
+                # Query 1: Fetch policies + product details for the agency
+                if clean_pols:
+                    query_policies = """
+                        SELECT 
+                            p.uuid AS product_uuid,
+                            p.name AS product_name,
+                            pol.uuid AS policy_uuid,
+                            pol.number AS policy_number,
+                            pol.writing_agent_user_id,
+                            pol.pay_to_agent_user_id
+                        FROM products p
+                        JOIN policies pol ON (pol.agency_id = p.agency_id AND pol.product_id = p.uuid)
+                        WHERE p.agency_id = %s
+                          AND pol.agency_id = %s
+                          AND pol.number = ANY(%s);
+                    """
+                    cur.execute(query_policies, (agency_id, agency_id, clean_pols))
+                else:
+                    query_policies = """
+                        SELECT 
+                            p.uuid AS product_uuid,
+                            p.name AS product_name,
+                            pol.uuid AS policy_uuid,
+                            pol.number AS policy_number,
+                            pol.writing_agent_user_id,
+                            pol.pay_to_agent_user_id
+                        FROM products p
+                        JOIN policies pol ON (pol.agency_id = p.agency_id AND pol.product_id = p.uuid)
+                        WHERE p.agency_id = %s
+                          AND pol.agency_id = %s;
+                    """
+                    cur.execute(query_policies, (agency_id, agency_id))
+                policy_rows = cur.fetchall()
 
-                for r in rows:
-                    p_num = str(r["policy_number"]).strip()
-                    p_name = " ".join(str(r["product_name"]).lower().split())
-                    rec_dict = dict(r)
+                # Query 2: Fetch policy_commission records for the matching policies
+                if clean_pols:
+                    query_commissions = """
+                        SELECT 
+                            pc.uuid AS commission_uuid,
+                            pc.policy_uuid,
+                            pc.rule_name,
+                            pc.version,
+                            pc.commission_type,
+                            pc.payment_frequency,
+                            pc.month_from,
+                            pc.month_to,
+                            pc.payout_method,
+                            pc.fee_amount,
+                            pc.premium_amount,
+                            pc.commission_split
+                        FROM policy_commission pc
+                        WHERE pc.agency_id = %s
+                          AND pc.policy_uuid IN (
+                              SELECT uuid FROM policies WHERE agency_id = %s AND number = ANY(%s)
+                          );
+                    """
+                    cur.execute(query_commissions, (agency_id, agency_id, clean_pols))
+                else:
+                    query_commissions = """
+                        SELECT 
+                            pc.uuid AS commission_uuid,
+                            pc.policy_uuid,
+                            pc.rule_name,
+                            pc.version,
+                            pc.commission_type,
+                            pc.payment_frequency,
+                            pc.month_from,
+                            pc.month_to,
+                            pc.payout_method,
+                            pc.fee_amount,
+                            pc.premium_amount,
+                            pc.commission_split
+                        FROM policy_commission pc
+                        WHERE pc.agency_id = %s;
+                    """
+                    cur.execute(query_commissions, (agency_id,))
+                commission_rows = cur.fetchall()
+
+                # Group commission records by policy_uuid
+                comm_map = {}
+                for c in commission_rows:
+                    pol_uuid = str(c.get("policy_uuid", "")).strip()
+                    if pol_uuid:
+                        if pol_uuid not in comm_map:
+                            comm_map[pol_uuid] = []
+                        comm_map[pol_uuid].append(dict(c))
+
+                # Combine policies with matching commission records
+                for p in policy_rows:
+                    p_num = str(p["policy_number"]).strip()
+                    p_name = " ".join(str(p["product_name"]).lower().split())
+                    pol_uuid = str(p["policy_uuid"]).strip()
+
+                    matching_comms = comm_map.get(pol_uuid, [])
+                    if not matching_comms:
+                        rec = dict(p)
+                        rec.update({
+                            "commission_uuid": None,
+                            "rule_name": None,
+                            "commission_type": None,
+                            "payment_frequency": None,
+                            "month_from": None,
+                            "month_to": None,
+                            "payout_method": None,
+                            "fee_amount": None,
+                            "premium_amount": None,
+                            "commission_split": None,
+                        })
+                        recs = [rec]
+                    else:
+                        recs = []
+                        for c in matching_comms:
+                            rec = dict(p)
+                            rec.update(c)
+                            recs.append(rec)
 
                     # 1. Composite key index for exact product-policy pair matching
                     comp_key = (p_num, p_name)
                     if comp_key not in result_map:
                         result_map[comp_key] = []
-                    result_map[comp_key].append(rec_dict)
+                    result_map[comp_key].extend(recs)
 
                     # 2. Simple policy number index for fallback matching
                     if p_num not in result_map:
                         result_map[p_num] = []
-                    result_map[p_num].append(rec_dict)
+                    result_map[p_num].extend(recs)
 
             return result_map
         except Exception as e:
-            print(f"⚠️ Warning: Could not bulk fetch agency commission rules: {e}")
+            print(f"⚠️ Warning: Could not bulk fetch agency commission rules: {e}", flush=True)
             return {}
 
 
@@ -1120,6 +1380,7 @@ class DatabaseManager:
                         pol.pay_to_agent_user_id,
                         pc.uuid AS commission_uuid,
                         pc.rule_name,
+                        pc.version,
                         pc.commission_type,
                         pc.payment_frequency,
                         pc.month_from,
@@ -1196,8 +1457,9 @@ def build_file_commission_split(group: pd.DataFrame, seq_col, agent_col, agent_n
     for idx in group.index:
         row = group.loc[idx]
         seq = int(row.get(seq_col, 0)) if seq_col and pd.notna(row.get(seq_col)) else 0
-        agent_id = str(row.get(agent_col, "")).strip() if agent_col else ""
-        agent_name = str(row.get(agent_name_col, "")).strip() if agent_name_col else agent_id
+        raw_agent_id = str(row.get(agent_col, "")).strip() if agent_col else ""
+        agent_id = clean_agent_code(raw_agent_id)  # Strip leading quotes and trailing alpha suffixes (e.g. '21758900 -> 21758900, 21758900SL -> 21758900)
+        agent_name = str(row.get(agent_name_col, "")).strip() if agent_name_col else raw_agent_id
         contract = str(row.get(contract_col, "")).strip() if contract_col else ""
         commission_value = float(row.get(split_col, 0.0)) if split_col else 0.0
 
@@ -1277,7 +1539,7 @@ def stage2_db_verify_dataset(
     Returns: (matched_df, ambiguous_df, unmatched_df, missing_policy_payloads)
     """
     if df_valid.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), []
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), [], [], []
 
     df_out = df_valid.copy().reset_index(drop=True)
 
@@ -1300,6 +1562,7 @@ def stage2_db_verify_dataset(
     file_vals = [""] * len(df_out)
 
     matched_count = 0
+    ambiguous_count = 0
     unmatched_count = 0
     missing_policy_payloads = []
     mismatch_policy_payloads = []
@@ -1311,6 +1574,11 @@ def stage2_db_verify_dataset(
 
     print(f"🔍 Starting Stage 2 Chunked DB Verification for {total_groups:,} policy groups ({len(df_out):,} rows)...")
 
+    import_script_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "policy_commission_import_validation_script"))
+    if import_script_dir not in sys.path:
+        sys.path.append(import_script_dir)
+    from import_policy_commission import commission_payload_issues
+
     # Extract unique policy numbers for batch SQL chunking
     unique_exact_policy_numbers = []
     unique_similar_prefixes = []
@@ -1321,23 +1589,31 @@ def stage2_db_verify_dataset(
             pol = str(seq_1_row[pol_col]).strip()
             is_mapped = bool(seq_1_row.get("_is_mapped", False)) if "_is_mapped" in group.columns else False
             
+            if pol not in unique_exact_policy_numbers:
+                unique_exact_policy_numbers.append(pol)
+            if not is_mapped:
+                for candidate in policy_suffix_candidates(pol):
+                    if candidate not in unique_exact_policy_numbers:
+                        unique_exact_policy_numbers.append(candidate)
             if not is_mapped and len(pol) > 11:
                 prefix = pol[:11]
                 if prefix not in unique_similar_prefixes:
                     unique_similar_prefixes.append(prefix)
-            else:
-                if pol not in unique_exact_policy_numbers:
-                    unique_exact_policy_numbers.append(pol)
 
     # Pre-fetch all user UUIDs mapping for agency
     db_user_map = db_mgr.fetch_all_users_map(agency_id) if not dry_run and db_mgr.conn else {}
+
+    def writing_agent_name_for(record) -> str:
+        if not isinstance(record, dict):
+            return ""
+        return db_mgr.format_writing_agent(record.get("writing_agent_user_id"))
 
     # Pre-fetch ALL products, policies, and policy_commission rules in 1 single bulk SQL query
     chunk_db_map = {}
     prefix_db_map = {}
     if not dry_run and db_mgr.conn:
-        print(f" ⚡ Pre-fetching ALL agency policies & commission rules in 1 single bulk query for zero-latency verification...")
-        chunk_db_map = db_mgr.fetch_all_agency_commission_rules(agency_id)
+        print(f" ⚡ Pre-fetching agency policies & commission rules for {len(unique_exact_policy_numbers):,} policies in bulk...")
+        chunk_db_map = db_mgr.fetch_all_agency_commission_rules(agency_id, policy_numbers=unique_exact_policy_numbers)
         print(f"    ✅ Bulk loaded {len(chunk_db_map):,} policy/product indexes into RAM.")
         
         # Pre-index 11-char policy prefixes to eliminate O(N) linear set scans inside verification loop
@@ -1375,34 +1651,38 @@ def stage2_db_verify_dataset(
         else:
             is_mapped = bool(seq_1_row.get("_is_mapped", False)) if "_is_mapped" in seq_1_row else False
             is_ambiguous = False
-            
-            if not is_mapped and len(pol_number) > 11:
+            ambiguous_reason = ""
+
+            db_records = lookup_policy_db_records(chunk_db_map, pol_number, clean_prod_name)
+            if not db_records and not is_mapped:
+                for candidate in policy_suffix_candidates(pol_number):
+                    alt_records = lookup_policy_db_records(chunk_db_map, candidate, clean_prod_name)
+                    if not alt_records:
+                        continue
+                    distinct_numbers = {str(r.get("policy_number", "")).strip() for r in alt_records}
+                    distinct_numbers.discard("")
+                    if len(distinct_numbers) > 1:
+                        is_ambiguous = True
+                        ambiguous_reason = (
+                            f"Policy number '{pol_number}' matched multiple policies after removing the suffix "
+                            f"('{candidate}')."
+                        )
+                        db_records = []
+                        break
+                    db_records = alt_records
+                    break
+
+            if not db_records and not is_ambiguous and not is_mapped and len(pol_number) > 11:
                 prefix = pol_number[:11]
                 matched_full_pols = prefix_db_map.get(prefix, set())
-                
+
                 if len(matched_full_pols) > 1:
                     is_ambiguous = True
+                    ambiguous_reason = f"Policy number '{pol_number[:11]}...' matched multiple policies in DB."
                     db_records = []
                 elif len(matched_full_pols) == 1:
                     found_pol = next(iter(matched_full_pols))
-                    db_records = chunk_db_map.get((found_pol, clean_prod_name), [])
-                    if not db_records:
-                        db_records = chunk_db_map.get(found_pol, [])
-                else:
-                    db_records = []
-            else:
-                # 1. Primary lookup using composite tuple key
-                db_records = chunk_db_map.get((pol_number, clean_prod_name), [])
-                # 2. Fallback lookup
-                if not db_records:
-                    pol_records = chunk_db_map.get(pol_number, [])
-                    db_records = [
-                        r for r in pol_records 
-                        if clean_prod_name in " ".join(str(r.get("product_name", "")).lower().split())
-                        or " ".join(str(r.get("product_name", "")).lower().split()) in clean_prod_name
-                    ]
-                    if not db_records and pol_records:
-                        db_records = pol_records
+                    db_records = lookup_policy_db_records(chunk_db_map, found_pol, clean_prod_name)
 
             # Fallback DB Queries if not in chunk map
             found_prod_uuid = db_records[0].get("product_uuid") if db_records else None
@@ -1413,7 +1693,13 @@ def stage2_db_verify_dataset(
                 if not found_prod_uuid:
                     not_found_products.add(prod_name)
             if not found_pol_uuid and found_prod_uuid and pol_number not in not_found_policies:
-                found_pol_uuid = db_mgr.get_policy_uuid(agency_id, pol_number, found_prod_uuid)
+                lookup_numbers = [pol_number]
+                if not is_mapped:
+                    lookup_numbers.extend(policy_suffix_candidates(pol_number))
+                for lookup_number in lookup_numbers:
+                    found_pol_uuid = db_mgr.get_policy_uuid(agency_id, lookup_number, found_prod_uuid)
+                    if found_pol_uuid:
+                        break
                 if not found_pol_uuid:
                     not_found_policies.add(pol_number)
 
@@ -1423,7 +1709,7 @@ def stage2_db_verify_dataset(
                     obtained_product_uuids[idx] = None
                     obtained_policy_uuids[idx] = None
                     stage2_statuses[idx] = "AMBIGUOUS_SIMILAR_MATCH"
-                    unmatched_reasons[idx] = f"Policy number '{pol_number[:11]}...' matched multiple policies in DB."
+                    unmatched_reasons[idx] = ambiguous_reason or f"Policy number '{pol_number[:11]}...' matched multiple policies in DB."
                     db_vals[idx] = "N/A"
                     file_vals[idx] = "N/A"
             elif not found_prod_uuid or not found_pol_uuid:
@@ -1515,8 +1801,8 @@ def stage2_db_verify_dataset(
                                 if fetched_uuid:
                                     s_item["user_uuid"] = fetched_uuid
                             
-                            # Check: if commission_value > 0, user_uuid MUST be present
-                            if s_item["commission_value"] > 0 and not s_item.get("user_uuid"):
+                            # Check: ALL non-agency splits MUST have user_uuid (regardless of commission_value)
+                            if s_item.get("entity") != "agency" and not s_item.get("user_uuid"):
                                 missing_uuid_in_group = True
                             
                             sanitized_splits.append(s_item)
@@ -1524,6 +1810,7 @@ def stage2_db_verify_dataset(
                         missing_payload = {
                             "policyUuid": found_pol_uuid,
                             "policyNumber": pol_number,
+                            "writingAgentName": writing_agent_name_for(db_records[0] if db_records else None),
                             "ruleName": f"Carrier - Product - COMMISSION",
                             "version": 1,
                             "commissionType": 1,
@@ -1536,9 +1823,9 @@ def stage2_db_verify_dataset(
                             "commissionSplit": sanitized_splits
                         }
                         
-                        if missing_uuid_in_group:
-                            # Do NOT include in POST payloads list if user_uuid is missing for active commission splits
-                            missing_payload["_issue_reason"] = "Contains split with commission_value > 0 but missing user_uuid"
+                        split_issues = commission_payload_issues(missing_payload)
+                        if split_issues:
+                            missing_payload["_issue_reason"] = "; ".join(split_issues)
                             invalid_user_uuid_payloads.append(missing_payload)
                         else:
                             missing_policy_payloads.append(missing_payload)
@@ -1584,23 +1871,56 @@ def stage2_db_verify_dataset(
                         row_agent_name = str(row.get(agent_name_col, "")).strip() if agent_name_col else row_agent
                         norm_row_name = " ".join(row_agent_name.lower().split())
 
+                        # Determine file-side payout method and fee amount for comparison and PUT payload
+                        _file_payout_str = str(row.get("Payout Method", "")).strip().upper()
+                        _carrier_comm_raw = str(row.get("Carrier Commission", "") or row.get(rate_col, "") or row.get(amt_col, "")).strip()
+                        if "FIXED FEE" in _file_payout_str:
+                            _file_fee_val = parse_amount(_carrier_comm_raw)
+                            _file_payout_method_code = 1
+                        else:
+                            _file_fee_val = parse_rate(_carrier_comm_raw)
+                            _file_payout_method_code = 2
+
                         match_found = False
                         unmatched_agent = False
+                        period_found = False
                         matched_db_value = None
                         db_split_raw = None
                         matched_commission_uuid = None
                         matched_db_rec = None
 
-                        for db_rec in comm_records:
+                        # Score and sort comm_records for candidate matching:
+                        # 2 = exact period match (fm and tm match expected)
+                        # 1 = open-ended period match (fm matches, db_tm is NULL)
+                        # 0 = match on fm only
+                        def calc_comm_score(r):
+                            db_fm_val = r.get("month_from")
+                            db_tm_val = r.get("month_to")
+                            try:
+                                fm_i = int(db_fm_val) if db_fm_val is not None else 1
+                            except (ValueError, TypeError):
+                                fm_i = 1
+                            if fm_i != file_fm:
+                                return -1
+                            if db_tm_val == expected_db_tm:
+                                return 2
+                            if db_tm_val is None:
+                                return 1
+                            return 0
+
+                        matching_comm_records = [r for r in comm_records if calc_comm_score(r) >= 0]
+                        matching_comm_records.sort(key=calc_comm_score, reverse=True)
+
+                        if matching_comm_records:
+                            period_found = True
+
+                        for db_rec in matching_comm_records:
                             db_fm = db_rec.get("month_from")
                             db_tm = db_rec.get("month_to")
-                            
-                            # Skip DB rules that do not match this file row's period
-                            if db_fm != file_fm or db_tm != expected_db_tm:
-                                continue
-                                
                             db_split_raw = db_rec.get("commission_split")
                             db_fee = float(db_rec.get("fee_amount") or 0.0)
+                            db_payout_raw = db_rec.get("payout_method")
+                            db_payout_code = 1 if (isinstance(db_payout_raw, int) and db_payout_raw == 1) or str(db_payout_raw).strip() in ("1", "FIXED FEE", "FIXED_FEE") else 2
 
                             if isinstance(db_split_raw, list):
                                 for item in db_split_raw:
@@ -1613,9 +1933,9 @@ def stage2_db_verify_dataset(
                                     
                                     # Match Agent by user_code, fallback to normalized user_name
                                     is_agent_match = False
-                                    if row_agent and db_code and row_agent == db_code:
+                                    if row_agent and db_code and (row_agent == db_code or are_codes_matching(row_agent, db_code)):
                                         is_agent_match = True
-                                    elif norm_row_name and norm_db_name and norm_row_name == norm_db_name:
+                                    elif norm_row_name and norm_db_name and (norm_row_name == norm_db_name or are_names_matching(norm_row_name, norm_db_name)):
                                         is_agent_match = True
                                     elif str(item.get("order", "")) == "1" and (
                                         ("main line benefits" in norm_row_name and "mlb parallel run" in norm_db_name) or
@@ -1627,10 +1947,14 @@ def stage2_db_verify_dataset(
                                         db_val = item.get("commission_value")
                                         if db_val is not None:
                                             matched_db_value = float(db_val)
-                                            if abs(matched_db_value - row_split) <= tolerance or abs(matched_db_value - row_rate) <= tolerance:
+                                            split_matches = (abs(matched_db_value - row_split) <= tolerance or abs(matched_db_value - row_rate) <= tolerance)
+                                            fee_matches = (abs(db_fee - _file_fee_val) <= tolerance)
+                                            payout_matches = (db_payout_code == _file_payout_method_code)
+                                            if split_matches and fee_matches and payout_matches and db_tm == expected_db_tm:
                                                 match_found = True
-                                                matched_commission_uuid = db_rec.get("commission_uuid")
-                                                matched_db_rec = db_rec
+                                            matched_commission_uuid = db_rec.get("commission_uuid")
+                                            matched_db_rec = db_rec
+                                            if match_found:
                                                 break
                                         unmatched_agent = True
                                         
@@ -1643,10 +1967,11 @@ def stage2_db_verify_dataset(
                                     
                             # Fallback for Fixed Fee rules where db_split_raw might be empty but fee_amount matches
                             if not match_found and not unmatched_agent and db_fee > 0 and abs(parse_amount(row.get(rate_col, 0)) - db_fee) <= tolerance:
-                                match_found = True
                                 matched_commission_uuid = db_rec.get("commission_uuid")
                                 matched_db_rec = db_rec
-                                break
+                                if db_tm == expected_db_tm:
+                                    match_found = True
+                                    break
                             
                             # If we get here, it means we found a rule for the period but failed the agent/rate check
                             if not match_found:
@@ -1660,108 +1985,238 @@ def stage2_db_verify_dataset(
                             file_vals[idx] = file_split_json
                             matched_count += 1
                         else:
-                            stage2_statuses[idx] = "DB_COMMISSION_VALUE_MISMATCH"
-                            if unmatched_agent:
-                                matched_db_value_str = f"{matched_db_value}%" if matched_db_value is not None else "None"
-                                unmatched_reasons[idx] = (
-                                    f"Agent '{row_agent_name}' found in DB, but DB commission_value is {matched_db_value_str} (File has {row_split}%). "
-                                )
-                            else:
-                                code_str = f" (Code: {row_agent})" if row_agent else ""
-                                unmatched_reasons[idx] = (
-                                    f"No commission rule record found in policy_commission table for agent '{row_agent_name}'{code_str}. "
-                                )
-                            db_vals[idx] = json.dumps(db_split_raw) if isinstance(db_split_raw, (list, dict)) else str(db_split_raw)
-                            file_vals[idx] = file_split_json
-                            unmatched_count += 1
-                            
-                            if matched_commission_uuid and matched_db_rec:
-                                # Merge DB fields into file splits and build diff
-                                merged_splits = []
-                                diff_lines = []
+                            if not period_found:
+                                stage2_statuses[idx] = "NO_COMMISSION_RULE_FOUND_FOR_PERIOD"
+                                unmatched_reasons[idx] = f"No commission rule found in DB for period {file_fm} -> {expected_db_tm}."
+                                db_vals[idx] = "N/A"
+                                file_vals[idx] = file_split_json
+                                unmatched_count += 1
                                 
-                                db_splits_list = db_split_raw if isinstance(db_split_raw, list) else []
-                                db_split_dict = {str(s.get("order", "")): s for s in db_splits_list}
-                                
-                                for f_split in file_commission_split:
-                                    m_split = f_split.copy()
-                                    order_str = str(m_split.get("order", ""))
-                                    db_s = db_split_dict.get(order_str)
+                                fee_val = 0.0
+                                prem_val = 0.0
+                                carrier_comm_raw = str(row.get("Carrier Commission", "") or row.get(rate_col, "") or row.get(amt_col, "")).strip()
+                                file_payout_method_str = str(row.get("Payout Method", "")).strip().upper()
+                                if "FIXED FEE" in file_payout_method_str:
+                                    fee_val = parse_amount(carrier_comm_raw)
+                                    payout_method_code = 1
+                                else:
+                                    fee_val = parse_rate(carrier_comm_raw)
+                                    payout_method_code = 2
                                     
-                                    if db_s:
-                                        # Preserve existing DB fields
-                                        for key in ["user_uuid", "role", "level", "user_name", "user_code"]:
-                                            if key in db_s:
-                                                m_split[key] = db_s[key]
-                                        
-                                        # Diff check (use tolerance parameter)
-                                        old_val = float(db_s.get("commission_value") or 0.0)
-                                        new_val = float(m_split.get("commission_value") or 0.0)
-                                        
-                                        if abs(old_val - new_val) > tolerance:
-                                            diff_lines.append(f"   Order {order_str} | User: {m_split.get('user_name', 'N/A')} | Rate: {old_val}% ➔ {new_val}%")
-                                    else:
-                                        diff_lines.append(f"   Order {order_str} | User: [NEW] ➔ {m_split.get('user_name', 'N/A')} | Rate: [NEW] ➔ {m_split.get('commission_value', 0.0)}%")
-                                        if "level" in m_split:
-                                            m_split["level"] = normalize_level(m_split["level"])
-                                        
-                                    if str(m_split.get("order", "")) == "1" or str(m_split.get("role", "")).lower() == "agency":
-                                        m_split["user_uuid"] = "62a97a01-2801-4c7c-9cd0-cf38f2e0a4f4"
-                                        m_split["user_code"] = ""
-                                        m_split["level"] = ""
-
-                                    # Lookup user_uuid if missing (e.g. for new orders)
-                                    if not m_split.get("user_uuid"):
-                                        u_code = str(m_split.get("user_code") or "").strip().lower()
-                                        u_name = " ".join(str(m_split.get("user_name") or "").strip().lower().split())
+                                sanitized_splits = []
+                                missing_uuid_in_group = False
+                                for split_item in file_commission_split:
+                                    s_item = split_item.copy()
+                                    c_val = float(s_item.get("commission_value") or 0.0)
+                                    s_item["commission_value"] = max(0.0, c_val)
+                                    if not s_item.get("user_uuid"):
+                                        u_code = str(s_item.get("user_code") or "").strip().lower()
+                                        u_name = " ".join(str(s_item.get("user_name") or "").strip().lower().split())
                                         fetched_uuid = db_user_map.get(u_code) if u_code else None
                                         if not fetched_uuid and u_name:
                                             fetched_uuid = db_user_map.get(u_name)
                                         if not fetched_uuid and (u_code or u_name):
-                                            fetched_uuid = db_mgr.get_user_uuid(agency_id, user_code=m_split.get("user_code"), user_name=m_split.get("user_name"))
-                                            # Cache result in db_user_map to avoid redundant DB queries
-                                            if u_code:
-                                                db_user_map[u_code] = fetched_uuid
-                                            if u_name:
-                                                db_user_map[u_name] = fetched_uuid
+                                            fetched_uuid = db_mgr.get_user_uuid(agency_id, user_code=s_item.get("user_code"), user_name=s_item.get("user_name"))
+                                            if u_code: db_user_map[u_code] = fetched_uuid
+                                            if u_name: db_user_map[u_name] = fetched_uuid
                                         if fetched_uuid:
-                                            m_split["user_uuid"] = fetched_uuid
-                                    # Ensure no negative commission values
-                                    c_val = float(m_split.get("commission_value") or 0.0)
-                                    m_split["commission_value"] = max(0.0, c_val)
-
-                                    merged_splits.append(m_split)
+                                            s_item["user_uuid"] = fetched_uuid
+                                    # Check: ALL non-agency splits MUST have user_uuid (regardless of commission_value)
+                                    if s_item.get("entity") != "agency" and not s_item.get("user_uuid"):
+                                        missing_uuid_in_group = True
+                                    sanitized_splits.append(s_item)
                                     
-                                db_fm_val = int(matched_db_rec.get("month_from") or 1)
-                                db_tm_val = int(matched_db_rec.get("month_to") or 12) if matched_db_rec.get("month_to") is not None else "None"
-                                file_tm_val = expected_db_tm if expected_db_tm is not None else "None"
-                                if db_fm_val != file_fm or matched_db_rec.get("month_to") != expected_db_tm:
-                                    diff_lines.append(f"   Period: {db_fm_val}-{db_tm_val} ➔ {file_fm}-{file_tm_val}")
-
-                                if not diff_lines:
-                                    # If only names were fuzzy matched or rates differed by <0.00%, don't bother PUTting
-                                    continue
-                                
-                                diff_text = "\n".join(diff_lines)
-
-                                mismatch_payload = {
-                                    "rule_uuid": matched_commission_uuid,
+                                missing_payload = {
+                                    "policyUuid": found_pol_uuid,
                                     "policyNumber": pol_number,
-                                    "policyUuid": matched_db_rec.get("policy_uuid"),
-                                    "ruleName": matched_db_rec.get("rule_name", f"Carrier - Product - COMMISSION"),
-                                    "version": matched_db_rec.get("version", 1),
-                                    "commissionType": matched_db_rec.get("commission_type", 1),
-                                    "paymentFrequency": matched_db_rec.get("payment_frequency", 1),
-                                    "payoutMethod": matched_db_rec.get("payout_method", 2),
+                                    "writingAgentName": writing_agent_name_for(db_records[0] if db_records else None),
+                                    "ruleName": f"Carrier - Product - COMMISSION",
+                                    "version": 1,
+                                    "commissionType": 1,
+                                    "paymentFrequency": 1,
+                                    "payoutMethod": payout_method_code,
                                     "monthFrom": file_fm,
                                     "monthTo": expected_db_tm,
-                                    "feeAmount": float(matched_db_rec.get("fee_amount") or 0.0),
-                                    "premiumAmount": float(matched_db_rec.get("premium_amount") or 0.0),
-                                    "commissionSplit": merged_splits,
-                                    "_diff_text": diff_text
+                                    "feeAmount": fee_val,
+                                    "premiumAmount": prem_val,
+                                    "commissionSplit": sanitized_splits
                                 }
-                                mismatch_policy_payloads.append(mismatch_payload)
+                                split_issues = commission_payload_issues(missing_payload)
+                                if split_issues:
+                                    missing_payload["_issue_reason"] = "; ".join(split_issues)
+                                    invalid_user_uuid_payloads.append(missing_payload)
+                                else:
+                                    missing_policy_payloads.append(missing_payload)
+                            else:
+                                stage2_statuses[idx] = "DB_COMMISSION_VALUE_MISMATCH"
+                                if unmatched_agent:
+                                    matched_db_value_str = f"{matched_db_value}%" if matched_db_value is not None else "None"
+                                    db_fee_curr = float(matched_db_rec.get("fee_amount") or 0.0) if matched_db_rec else 0.0
+                                    if matched_db_rec and abs(db_fee_curr - _file_fee_val) > tolerance:
+                                        unmatched_reasons[idx] = (
+                                            f"Agent '{row_agent_name}' found in DB, but DB fee_amount is {db_fee_curr} (File has {_file_fee_val}). "
+                                        )
+                                    else:
+                                        unmatched_reasons[idx] = (
+                                            f"Agent '{row_agent_name}' found in DB, but DB commission_value is {matched_db_value_str} (File has {row_split}%). "
+                                        )
+                                else:
+                                    code_str = f" (Code: {row_agent})" if row_agent else ""
+                                    unmatched_reasons[idx] = (
+                                        f"No commission rule record found in policy_commission table for agent '{row_agent_name}'{code_str}. "
+                                    )
+                                db_vals[idx] = json.dumps(db_split_raw) if isinstance(db_split_raw, (list, dict)) else str(db_split_raw)
+                                file_vals[idx] = file_split_json
+                                unmatched_count += 1
+                                
+                                if matched_commission_uuid and matched_db_rec:
+                                    # Merge DB fields into file splits and build diff
+                                    merged_splits = []
+                                    diff_lines = []
+                                    
+                                    db_splits_list = db_split_raw if isinstance(db_split_raw, list) else []
+                                    db_split_dict = {str(s.get("order", "")): s for s in db_splits_list}
+                                    
+                                    for f_split in file_commission_split:
+                                        m_split = f_split.copy()
+                                        order_str = str(m_split.get("order", ""))
+                                        db_s = db_split_dict.get(order_str)
+                                        
+                                        f_code = str(m_split.get("user_code") or "").strip().lower()
+                                        f_name = " ".join(str(m_split.get("user_name") or "").strip().lower().split())
+    
+                                        if db_s:
+                                            db_code = str(db_s.get("user_code") or "").strip().lower()
+                                            db_name = " ".join(str(db_s.get("user_name") or "").strip().lower().split())
+    
+                                            # Cache DB user_uuid for fast lookup
+                                            if db_s.get("user_uuid"):
+                                                if db_code:
+                                                    db_user_map[db_code] = db_s["user_uuid"]
+                                                if db_name:
+                                                    db_user_map[db_name] = db_s["user_uuid"]
+    
+                                            agent_changed = False
+                                            if f_code and db_code:
+                                                if not (f_code == db_code or are_codes_matching(f_code, db_code) or are_names_matching(f_name, db_name)):
+                                                    agent_changed = True
+                                            elif f_name and db_name:
+                                                if not (f_name == db_name or are_names_matching(f_name, db_name)):
+                                                    agent_changed = True
+    
+                                            old_val = float(db_s.get("commission_value") or 0.0)
+                                            new_val = float(m_split.get("commission_value") or 0.0)
+                                            val_changed = abs(old_val - new_val) > tolerance
+    
+                                            db_user_disp = f"{db_s.get('user_name', '')} ({db_s.get('user_code', '')})".strip() or "N/A"
+                                            f_user_disp = f"{m_split.get('user_name', '')} ({m_split.get('user_code', '')})".strip() or "N/A"
+    
+                                            if agent_changed and val_changed:
+                                                diff_lines.append(f"   Order {order_str} | User: {db_user_disp} ➔ {f_user_disp} | Rate: {old_val}% ➔ {new_val}%")
+                                            elif agent_changed:
+                                                diff_lines.append(f"   Order {order_str} | User: {db_user_disp} ➔ {f_user_disp}")
+                                            elif val_changed:
+                                                diff_lines.append(f"   Order {order_str} | User: {f_user_disp} | Rate: {old_val}% ➔ {new_val}%")
+    
+                                            # Preserve existing DB fields only if agent did NOT change
+                                            if not agent_changed:
+                                                for key in ["user_uuid", "user_name", "user_code"]:
+                                                    if key in db_s:
+                                                        m_split[key] = db_s[key]
+                                            for key in ["role", "level"]:
+                                                if key in db_s and not m_split.get(key):
+                                                    m_split[key] = db_s[key]
+                                        else:
+                                            diff_lines.append(f"   Order {order_str} | User: [NEW] ➔ {m_split.get('user_name', 'N/A')} | Rate: [NEW] ➔ {m_split.get('commission_value', 0.0)}%")
+                                            if "level" in m_split:
+                                                m_split["level"] = normalize_level(m_split["level"])
+                                            
+                                        if str(m_split.get("order", "")) == "1" or str(m_split.get("role", "")).lower() == "agency":
+                                            m_split["user_uuid"] = "62a97a01-2801-4c7c-9cd0-cf38f2e0a4f4"
+                                            m_split["user_code"] = ""
+                                            m_split["level"] = ""
+    
+                                        # Lookup user_uuid if missing (e.g. for new orders)
+                                        if not m_split.get("user_uuid"):
+                                            u_code = str(m_split.get("user_code") or "").strip().lower()
+                                            u_name = " ".join(str(m_split.get("user_name") or "").strip().lower().split())
+                                            fetched_uuid = db_user_map.get(u_code) if u_code else None
+                                            if not fetched_uuid and u_name:
+                                                fetched_uuid = db_user_map.get(u_name)
+                                            if not fetched_uuid and (u_code or u_name):
+                                                fetched_uuid = db_mgr.get_user_uuid(agency_id, user_code=m_split.get("user_code"), user_name=m_split.get("user_name"))
+                                                # Cache result in db_user_map to avoid redundant DB queries
+                                                if u_code:
+                                                    db_user_map[u_code] = fetched_uuid
+                                                if u_name:
+                                                    db_user_map[u_name] = fetched_uuid
+                                            if fetched_uuid:
+                                                m_split["user_uuid"] = fetched_uuid
+                                        # Ensure no negative commission values
+                                        c_val = float(m_split.get("commission_value") or 0.0)
+                                        m_split["commission_value"] = max(0.0, c_val)
+    
+                                        merged_splits.append(m_split)
+                                    
+                                    # Preserve any extra DB split orders that were not present in the input file
+                                    file_orders = {str(f.get("order", "")) for f in file_commission_split}
+                                    for db_s in db_splits_list:
+                                        db_order_str = str(db_s.get("order", ""))
+                                        if db_order_str and db_order_str not in file_orders:
+                                            merged_splits.append(db_s.copy())
+                                    
+                                    merged_splits.sort(key=lambda s: int(s.get("order") or 999))
+                                    db_fm_val = int(matched_db_rec.get("month_from") or 1)
+                                    db_tm_val = int(matched_db_rec.get("month_to") or 12) if matched_db_rec.get("month_to") is not None else "None"
+                                    file_tm_val = expected_db_tm if expected_db_tm is not None else "None"
+                                    if db_fm_val != file_fm or matched_db_rec.get("month_to") != expected_db_tm:
+                                        diff_lines.append(f"   Period: {db_fm_val}-{db_tm_val} ➔ {file_fm}-{file_tm_val}")
 
+                                    db_fee_val = float(matched_db_rec.get("fee_amount") or 0.0)
+                                    if abs(db_fee_val - _file_fee_val) > tolerance:
+                                        payout_label = "Fixed Fee" if _file_payout_method_code == 1 else "Rate"
+                                        diff_lines.append(f"   Fee/Rate ({payout_label}): {db_fee_val} ➔ {_file_fee_val}")
+
+                                    db_payout_raw = matched_db_rec.get("payout_method")
+                                    db_payout_code = 1 if (isinstance(db_payout_raw, int) and db_payout_raw == 1) or str(db_payout_raw).strip() in ("1", "FIXED FEE", "FIXED_FEE") else 2
+                                    if db_payout_code != _file_payout_method_code:
+                                        old_p_label = "Fixed Fee" if db_payout_code == 1 else "Percentage"
+                                        new_p_label = "Fixed Fee" if _file_payout_method_code == 1 else "Percentage"
+                                        diff_lines.append(f"   Payout Method: {old_p_label} ➔ {new_p_label}")
+    
+                                    if not diff_lines:
+                                        # If only names were fuzzy matched or rates differed by <0.00%, don't bother PUTting
+                                        continue
+                                    
+                                    diff_text = "\n".join(diff_lines)
+    
+
+                                    mismatch_payload = {
+                                        "rule_uuid": matched_commission_uuid,
+                                        "policyNumber": pol_number,
+                                        "policyUuid": matched_db_rec.get("policy_uuid"),
+                                        "writingAgentName": writing_agent_name_for(
+                                            matched_db_rec if matched_db_rec.get("writing_agent_user_id") else (db_records[0] if db_records else None)
+                                        ),
+                                        "ruleName": matched_db_rec.get("rule_name") or "Carrier - Product - COMMISSION",
+                                        "version": matched_db_rec.get("version") or 1,
+                                        "commissionType": matched_db_rec.get("commission_type", 1),
+                                        "paymentFrequency": matched_db_rec.get("payment_frequency", 1),
+                                        "payoutMethod": _file_payout_method_code,
+                                        "monthFrom": file_fm,
+                                        "monthTo": expected_db_tm,
+                                        "feeAmount": _file_fee_val,
+                                        "premiumAmount": float(matched_db_rec.get("premium_amount") or 0.0),
+                                        "commissionSplit": merged_splits,
+                                        "_diff_text": diff_text
+                                    }
+                                    split_issues = commission_payload_issues(mismatch_payload)
+                                    if split_issues:
+                                        mismatch_payload["_issue_reason"] = "; ".join(split_issues)
+                                        invalid_user_uuid_payloads.append(mismatch_payload)
+                                    else:
+                                        mismatch_policy_payloads.append(mismatch_payload)
+    
         if group_idx % 50 == 0 or group_idx == total_groups:
             pct = (group_idx / total_groups) * 100.0
             sys.stdout.write(
@@ -1793,12 +2248,13 @@ def stage2_db_verify_dataset(
         "unmatched_records": len(df_unmatched),
     }
 
-    # Dedup the missing payloads by policyUuid
+    # Dedup the missing payloads by policyUuid and monthFrom
     unique_missing_payloads = []
     seen_missing = set()
     for mp in missing_policy_payloads:
-        if mp["policyUuid"] not in seen_missing:
-            seen_missing.add(mp["policyUuid"])
+        dedup_key = (mp["policyUuid"], mp.get("monthFrom"), mp.get("monthTo"))
+        if dedup_key not in seen_missing:
+            seen_missing.add(dedup_key)
             unique_missing_payloads.append(mp)
 
     # Dedup the mismatch payloads by rule_uuid
@@ -1810,6 +2266,291 @@ def stage2_db_verify_dataset(
             unique_mismatch_payloads.append(mp)
 
     return df_matched, df_ambiguous, df_unmatched, unique_missing_payloads, unique_mismatch_payloads, invalid_user_uuid_payloads
+
+
+# ---------------------------------------------------------------------------
+# STAGE 1.5: DB Commission Snapshot Export
+# ---------------------------------------------------------------------------
+def fetch_db_commission_snapshot(
+    df_stage1_valid: pd.DataFrame,
+    db_mgr: "DatabaseManager",
+    agency_id: int,
+    users_map: Dict[str, str],
+) -> pd.DataFrame:
+    """
+    Stage 1.5: Fetches the current policy_commission rows from the DB for every policy
+    that passed Stage 1 validation, and reconstructs them into the same column format
+    as the original uploaded file (one row per commission split entry).
+
+    Returns a DataFrame with rows ordered: policy group → split order.
+    """
+    if df_stage1_valid.empty:
+        return pd.DataFrame()
+
+    # Detect input file column names (mirrors stage2 column detection)
+    pol_col   = next((c for c in df_stage1_valid.columns if str(c).strip().lower() in ("policy no", "policy number", "policy", "policyno", "policy_number")), None)
+    prod_col  = next((c for c in df_stage1_valid.columns if str(c).strip().lower() in ("normalized_product_name", "product name", "product", "product_name", "product_description")), None)
+    fm_col    = next((c for c in df_stage1_valid.columns if str(c).strip().lower() in ("from month", "from_month", "month", "month from", "month_from")), None)
+    tm_col    = next((c for c in df_stage1_valid.columns if str(c).strip().lower() in ("to month", "to_month", "month to", "month_to")), None)
+    seq_col   = next((c for c in df_stage1_valid.columns if str(c).strip().lower() in ("sequence", "seq")), None)
+    agent_col = next((c for c in df_stage1_valid.columns if str(c).strip().lower() in ("agent id", "agent_id", "agentid")), None)
+    agent_name_col = next((c for c in df_stage1_valid.columns if "agent name" in str(c).strip().lower() or str(c).strip().lower() == "agent_name"), None)
+    rate_col  = next((c for c in df_stage1_valid.columns if str(c).strip().lower() in ("rate", "rate %", "commission %")), None)
+    amt_col   = next((c for c in df_stage1_valid.columns if str(c).strip().lower() in ("amount", "fee amount", "fee_amount")), None)
+
+    # Resolve canonical output column names (use the actual found column names where available)
+    out_pol_col        = pol_col         or "Policy No"
+    out_prod_col       = prod_col        or "Product"
+    out_fm_col         = fm_col          or "From Month"
+    out_tm_col         = tm_col          or "To Month"
+    out_seq_col        = seq_col         or "Sequence"
+    out_agent_name_col = agent_name_col  or "Agent Name"
+    out_agent_id_col   = agent_col       or "Agent ID"
+    out_rate_col       = rate_col        or "Rate"
+    out_amt_col        = amt_col         or "Amount"
+
+    # Extract unique policy numbers for bulk pre-fetch (same as Stage 2)
+    unique_policy_numbers = []
+    if pol_col:
+        for v in df_stage1_valid[pol_col].dropna().unique():
+            p = str(v).strip()
+            if p and p.lower() not in ("nan", "none", ""):
+                unique_policy_numbers.append(p)
+
+    print(f"   ⚡ Bulk fetching DB commission rows for {len(unique_policy_numbers):,} unique policies...")
+    db_map = db_mgr.fetch_all_agency_commission_rules(agency_id, policy_numbers=unique_policy_numbers)
+    print(f"   ✅ Bulk loaded {len(db_map):,} policy/product indexes.")
+
+    output_rows = []
+
+    # Iterate over each unique (policy, product, from_month, to_month) tier group from the valid file
+    group_cols = [c for c in [pol_col, prod_col, fm_col, tm_col] if c]
+    if group_cols:
+        grouped = df_stage1_valid.groupby(group_cols, sort=False)
+    else:
+        grouped = [(None, df_stage1_valid)]
+
+    seen_policy_product_pairs: Set[Tuple[str, str]] = set()
+
+    for _, group in grouped:
+        first_row = group.iloc[0]
+
+        pol_number  = str(first_row.get(pol_col, "")).strip()   if pol_col  else ""
+        prod_name   = str(first_row.get(prod_col, "")).strip()  if prod_col else ""
+        clean_prod  = " ".join(prod_name.lower().split())
+
+        raw_fm = first_row.get(fm_col, 1) if fm_col else 1
+        raw_tm = first_row.get(tm_col, 0) if tm_col else 0
+        try:
+            file_fm = int(float(str(raw_fm).strip().replace("'", "").replace('"', "")))
+        except Exception:
+            file_fm = 1
+        try:
+            file_tm = int(float(str(raw_tm).strip().replace("'", "").replace('"', "")))
+        except Exception:
+            file_tm = 0
+
+        if not pol_number or pol_number.lower() in ("nan", "none", ""):
+            continue
+
+        # Look up DB records (composite key first, then policy-number fallback)
+        db_records = db_map.get((pol_number, clean_prod), [])
+        if not db_records:
+            pol_recs = db_map.get(pol_number, [])
+            db_records = [
+                r for r in pol_recs
+                if clean_prod in " ".join(str(r.get("product_name", "")).lower().split())
+                or " ".join(str(r.get("product_name", "")).lower().split()) in clean_prod
+            ]
+            if not db_records and pol_recs:
+                db_records = pol_recs
+
+        if not db_records:
+            # Policy not found in DB at all — emit a single placeholder row
+            output_rows.append({
+                out_pol_col:        pol_number,
+                out_prod_col:       prod_name,
+                out_fm_col:         file_fm,
+                out_tm_col:         file_tm if file_tm else "",
+                out_seq_col:        "",
+                out_agent_name_col: "",
+                out_agent_id_col:   "",
+                out_rate_col:       "",
+                out_amt_col:        "",
+                "Carrier Commission": "",
+                "Payout Method":     "",
+                "Rule Name":         "",
+                "DB Commission UUID": "",
+                "DB_Status":         "NOT_FOUND_IN_DB",
+            })
+            continue
+
+        # Filter DB commission records to the tier (month range) matching the file group
+        tier_records = [
+            r for r in db_records
+            if r.get("commission_uuid") is not None
+            and (r.get("month_from") is None or int(r.get("month_from") or 1) == file_fm)
+        ]
+
+        if not tier_records:
+            # Policy exists but has no commission rules at this tier
+            output_rows.append({
+                out_pol_col:        pol_number,
+                out_prod_col:       prod_name,
+                out_fm_col:         file_fm,
+                out_tm_col:         file_tm if file_tm else "",
+                out_seq_col:        "",
+                out_agent_name_col: "",
+                out_agent_id_col:   "",
+                out_rate_col:       "",
+                out_amt_col:        "",
+                "Carrier Commission": "",
+                "Payout Method":     "",
+                "Rule Name":         "",
+                "DB Commission UUID": "",
+                "DB_Status":         "NO_COMMISSION_RULES_IN_DB",
+            })
+            continue
+
+        # Emit one row per commission rule × per split entry
+        for db_rec in tier_records:
+            db_commission_uuid = str(db_rec.get("commission_uuid", "") or "")
+            rule_name          = str(db_rec.get("rule_name", "") or "")
+            db_payout_method   = str(db_rec.get("payout_method", "") or "").upper()
+            db_fee_amount      = db_rec.get("fee_amount")   # numeric or None
+            db_month_from      = db_rec.get("month_from")   # numeric or None
+            db_month_to        = db_rec.get("month_to")     # numeric or None
+            db_prem_amount     = db_rec.get("premium_amount")
+
+            # Decode commission_split JSONB (may already be a list/dict or a JSON string)
+            raw_split = db_rec.get("commission_split")
+            split_entries: List[dict] = []
+            if raw_split is not None:
+                if isinstance(raw_split, list):
+                    split_entries = raw_split
+                elif isinstance(raw_split, str) and raw_split.strip():
+                    try:
+                        parsed = json.loads(raw_split)
+                        split_entries = parsed if isinstance(parsed, list) else []
+                    except (json.JSONDecodeError, TypeError):
+                        split_entries = []
+
+            # Determine carrier commission display value
+            if "FIXED" in db_payout_method:
+                carrier_comm_display = format_amount(float(db_fee_amount)) if db_fee_amount is not None else ""
+            else:
+                # For PERCENTAGE, carrier commission = the highest-order (agency) split value
+                agency_entry = next((s for s in split_entries if str(s.get("role", "")).lower() in ("agency", "") or s.get("order") == 1), None)
+                if agency_entry:
+                    carrier_comm_display = format_rate(float(agency_entry.get("commission_value") or 0.0))
+                elif db_fee_amount is not None:
+                    carrier_comm_display = format_rate(float(db_fee_amount))
+                else:
+                    carrier_comm_display = ""
+
+            from_m_out = int(db_month_from) if db_month_from is not None else file_fm
+            to_m_out   = int(db_month_to)   if db_month_to   is not None else (file_tm if file_tm else "")
+
+            if not split_entries:
+                # No split data — emit one row with just the commission rule meta
+                rate_out = format_rate(float(db_fee_amount)) if "PERCENT" in db_payout_method and db_fee_amount is not None else ""
+                amt_out  = format_amount(float(db_fee_amount)) if "FIXED" in db_payout_method and db_fee_amount is not None else ""
+                output_rows.append({
+                    out_pol_col:        pol_number,
+                    out_prod_col:       prod_name,
+                    out_fm_col:         from_m_out,
+                    out_tm_col:         to_m_out,
+                    out_seq_col:        "",
+                    out_agent_name_col: "",
+                    out_agent_id_col:   "",
+                    out_rate_col:       rate_out,
+                    out_amt_col:        amt_out,
+                    "Carrier Commission": carrier_comm_display,
+                    "Payout Method":     db_payout_method,
+                    "Rule Name":         rule_name,
+                    "DB Commission UUID": db_commission_uuid,
+                    "DB_Status":         "DB_VALUE",
+                })
+            else:
+                # Sort split entries by order (ascending) for consistent row order
+                split_entries_sorted = sorted(split_entries, key=lambda s: int(s.get("order") or 0))
+                for split in split_entries_sorted:
+                    split_order     = int(split.get("order") or 0)
+                    split_user_name = str(split.get("user_name", "") or "")
+                    split_user_code = str(split.get("user_code", "") or "")
+                    split_comm_val  = split.get("commission_value")
+
+                    # Map split value to Rate or Amount depending on payout method
+                    if "FIXED" in db_payout_method:
+                        rate_out = ""
+                        amt_out  = format_amount(float(split_comm_val)) if split_comm_val is not None else ""
+                    else:
+                        rate_out = format_rate(float(split_comm_val)) if split_comm_val is not None else ""
+                        amt_out  = ""
+
+                    output_rows.append({
+                        out_pol_col:        pol_number,
+                        out_prod_col:       prod_name,
+                        out_fm_col:         from_m_out,
+                        out_tm_col:         to_m_out,
+                        out_seq_col:        split_order,
+                        out_agent_name_col: split_user_name,
+                        out_agent_id_col:   split_user_code,
+                        out_rate_col:       rate_out,
+                        out_amt_col:        amt_out,
+                        "Carrier Commission": carrier_comm_display,
+                        "Payout Method":     db_payout_method,
+                        "Rule Name":         rule_name,
+                        "DB Commission UUID": db_commission_uuid,
+                        "DB_Status":         "DB_VALUE",
+                    })
+
+    return pd.DataFrame(output_rows)
+
+
+def export_db_commission_snapshot(
+    df_snapshot: pd.DataFrame,
+    versioned_dir: str,
+    df_stage1_valid: pd.DataFrame = None,
+    filename_prefix: str = "db_commission_snapshot",
+) -> str:
+    """
+    Exports the DB commission snapshot DataFrame to an Excel file.
+    Column order mirrors the original uploaded file columns, with DB-only
+    informational columns appended at the end.
+    Returns the output file path.
+    """
+    os.makedirs(versioned_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    snapshot_path = os.path.join(versioned_dir, f"{filename_prefix}_{timestamp}.xlsx")
+
+    if df_snapshot.empty:
+        df_snapshot.to_excel(snapshot_path, index=False)
+        return snapshot_path
+
+    # Build preferred column order: mirror file columns first, then DB-only extras
+    db_extra_cols  = ["Carrier Commission", "Payout Method", "Rule Name", "DB Commission UUID", "DB_Status"]
+    file_like_cols = [c for c in df_snapshot.columns if c not in db_extra_cols]
+
+    # If we have the original file columns, use them to anchor ordering
+    if df_stage1_valid is not None and not df_stage1_valid.empty:
+        original_cols = [c for c in df_stage1_valid.columns if not str(c).startswith("_") and c not in db_extra_cols]
+        # Keep any snapshot columns that exist in the file order first
+        ordered = [c for c in original_cols if c in df_snapshot.columns]
+        # Then append any remaining file-like cols not in the original
+        ordered += [c for c in file_like_cols if c not in ordered]
+    else:
+        ordered = file_like_cols
+
+    final_cols = ordered + [c for c in db_extra_cols if c in df_snapshot.columns]
+    df_out     = df_snapshot[final_cols].copy()
+
+    # Drop internal helper columns
+    drop_cols = [c for c in df_out.columns if str(c).startswith("_")]
+    df_out = df_out.drop(columns=drop_cols, errors="ignore")
+
+    df_out.to_excel(snapshot_path, index=False)
+    return snapshot_path
 
 
 # ---------------------------------------------------------------------------
@@ -1881,7 +2622,10 @@ def main():
         print(f"❌ Error: Input file not specified or file not found. Provide via --file or UPLOAD_FILE_PATH in .env.")
         sys.exit(1)
 
-    print(f"📖 Input Upload File: '{input_file}'")
+    if os.path.isdir(input_file):
+        print(f"📖 Input Upload Folder: '{input_file}' (all CSV and Excel files)")
+    else:
+        print(f"📖 Input Upload File: '{input_file}'")
     print(f"🏢 Target Agency ID: {agency_id}")
 
     print("\n----------------------------------------------------------")
@@ -2007,9 +2751,8 @@ def main():
     
     os.makedirs(input_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
-    
-    import shutil
-    shutil.copy2(input_file, os.path.join(input_dir, os.path.basename(input_file)))
+
+    archive_upload_input(input_file, input_dir)
 
     # Phase 1 Exports
     phase1_clean_path, phase1_error_path = export_phase1_reports(df_stage1_valid, df_stage1_invalid, output_dir)
@@ -2036,6 +2779,34 @@ def main():
     if dry_run_mode and not args.dry_run:
         print("⚠️ Notice: Database unestablished. Executing Stage 2 in DRY-RUN simulation mode.")
 
+    # ----------------------------------------------------------
+    # STAGE 1.5: DB COMMISSION SNAPSHOT EXPORT
+    # ----------------------------------------------------------
+    print("\n----------------------------------------------------------")
+    print("STAGE 1.5: FETCHING CURRENT DB COMMISSION VALUES FOR VALID POLICIES")
+    print("----------------------------------------------------------")
+    snapshot_path = ""
+    if db_connected and not dry_run_mode:
+        print(f"🔍 Fetching DB commission snapshot for {df_stage1_valid[next((c for c in df_stage1_valid.columns if str(c).strip().lower() in ('policy no', 'policy number', 'policy', 'policyno', 'policy_number')), df_stage1_valid.columns[0])].nunique() if not df_stage1_valid.empty else 0:,} unique policies...")
+        users_map_snapshot = db_mgr.fetch_all_users_map(agency_id)
+        df_db_snapshot = fetch_db_commission_snapshot(
+            df_stage1_valid=df_stage1_valid,
+            db_mgr=db_mgr,
+            agency_id=agency_id,
+            users_map=users_map_snapshot,
+        )
+        snapshot_path = export_db_commission_snapshot(
+            df_snapshot=df_db_snapshot,
+            versioned_dir=output_dir,
+            df_stage1_valid=df_stage1_valid,
+        )
+        snapshot_pol_col = next((c for c in df_db_snapshot.columns if str(c).strip().lower() in ("policy no", "policy number", "policy", "policyno", "policy_number")), None)
+        snapshot_unique_pols = df_db_snapshot[snapshot_pol_col].nunique() if snapshot_pol_col and not df_db_snapshot.empty else 0
+        print(f"   ✅ DB Snapshot: {len(df_db_snapshot):,} split rows across {snapshot_unique_pols:,} policies.")
+        print(f" 📁 DB Commission Snapshot : {snapshot_path}")
+    else:
+        print("   ⚠️ Skipping DB snapshot (no active DB connection or dry-run mode).")
+
     df_stage2_matched, df_stage2_ambiguous, df_stage2_unmatched, unique_missing_payloads, unique_mismatch_payloads, invalid_user_uuid_payloads = stage2_db_verify_dataset(
         df_valid=df_stage1_valid,
         db_mgr=db_mgr,
@@ -2049,7 +2820,7 @@ def main():
         missing_uuid_file = os.path.join(output_dir, f"rejected_missing_user_uuid_payloads_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         with open(missing_uuid_file, "w") as f:
             json.dump(invalid_user_uuid_payloads, f, indent=2)
-        print(f" ⚠️ Excluded {len(invalid_user_uuid_payloads):,} payload(s) with missing user_uuid. Logged to: {missing_uuid_file}")
+        print(f" ⚠️ Excluded {len(invalid_user_uuid_payloads):,} payload(s) that failed split validation. Logged to: {missing_uuid_file}")
 
     df_all_unmatched = pd.concat([df_stage1_invalid, df_stage2_unmatched], ignore_index=True)
 
@@ -2185,6 +2956,8 @@ def main():
     if s2_ambig > 0:
         print(f" 📁 Phase 2 Ambiguous   : {ambiguous_path}")
     print(f" 📁 Phase 2 Unmatched   : {phase2_unmatched_path}")
+    if snapshot_path:
+        print(f" 📁 DB Snapshot File    : {snapshot_path}")
     print("=========================================================================================")
     # Write comprehensive markdown summary report
     # Prepare detailed mismatches (if any)
@@ -2215,6 +2988,8 @@ def main():
                 md_file.write(f"**Phase 2 Ambiguous (Skipped):** {s2_ambig} ({pct_s2_ambig:.2f}%)\n")
             md_file.write(f"**Phase 2 Unmatched:** {s2_unmatch} ({pct_s2_unmatch:.2f}%)\n\n")
             md_file.write(f"**TOTAL FAILED / UNMATCHED (P1+P2):** {tot_unmatch} ({pct_tot_unmatch:.2f}%)\n\n")
+            if snapshot_path:
+                md_file.write(f"**DB Commission Snapshot:** [{os.path.basename(snapshot_path)}]({snapshot_path})\\n\\n")
             if detail_rows is not None and not detail_rows.empty:
                 md_file.write("## Detailed Stage 2 Mismatches\n\n")
                 for _, row in detail_rows.iterrows():
@@ -2272,9 +3047,9 @@ def main():
                             db_norm = " ".join(str(db_agent).lower().split())
                             file_norm = " ".join(str(file_agent).lower().split())
                             agent_match = False
-                            if file_code and db_code and str(file_code).strip() == str(db_code).strip():
+                            if file_code and db_code and (str(file_code).strip() == str(db_code).strip() or are_codes_matching(file_code, db_code)):
                                 agent_match = True
-                            elif file_norm and db_norm and file_norm == db_norm:
+                            elif file_norm and db_norm and (file_norm == db_norm or are_names_matching(file_norm, db_norm)):
                                 agent_match = True
                             elif not file_norm and not db_norm:
                                 agent_match = True  # Both missing agent (e.g. fixed fee)
@@ -2331,6 +3106,7 @@ def main():
     except Exception as e:
         print(f"⚠️ Failed to write markdown summary: {e}")
     print(f"\n📝 Validation summary markdown saved to: {md_summary_path}")
+    successful_policies = set()
 
     if unique_missing_payloads:
         print("\n" + "="*80)
@@ -2341,8 +3117,10 @@ def main():
             import sys
             import logging
             import urllib.request
-            import urllib.error
-            from dotenv import load_dotenv
+            try:
+                from dotenv import load_dotenv
+            except ImportError:
+                def load_dotenv(*args, **kwargs): pass
 
             other_script_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "policy_commission_import_validation_script"))
             other_env_path = os.path.join(other_script_dir, ".env")
@@ -2365,7 +3143,7 @@ def main():
                 api_base = os.environ.get("API_BASE_URL", "https://prod.api.pieq.ai").rstrip("/")
                 sso_url_raw = os.environ.get("AUTH_URL", "https://prod.auth.pieq.ai")
                 sso_url = f"{sso_url_raw.rstrip('/')}/realms/pieq-sso/protocol/openid-connect/token"
-                client_id = os.environ.get("KEYCLOAK_CLIENT_ID", "pieq-app")
+                client_id = os.environ.get("KEYCLOAK_CLIENT_ID") or os.environ.get("client_id") or "pieq-app"
                 username = os.environ.get("USERNAME")
                 password = os.environ.get("PASSWORD")
                 
@@ -2397,6 +3175,7 @@ def main():
                                 
                             # pop policyNumber because it's not part of PolicyCommissionRequest
                             pol_num = payload_to_send.pop("policyNumber", "Unknown")
+                            payload_to_send.pop("writingAgentName", None)
                             
                             # The POST endpoint accepts a List<PolicyCommissionRequest>
                             req = urllib.request.Request(
@@ -2410,6 +3189,7 @@ def main():
                                     res_bytes = resp.read()
                                     res_json = json.loads(res_bytes.decode("utf-8"))
                                     logger.info(f"✅ Success POSTing {pol_num} to {post_url}: {res_json}")
+                                    successful_policies.add(pol_num)
                             except urllib.error.HTTPError as e:
                                 if e.code == 401:
                                     logger.warning(f"⚠️ Token expired (HTTP 401). Re-fetching token and retrying POST for {pol_num}...")
@@ -2427,6 +3207,7 @@ def main():
                                                 res_bytes = resp.read()
                                                 res_json = json.loads(res_bytes.decode("utf-8"))
                                                 logger.info(f"✅ Success POSTing {pol_num} to {post_url} after token refresh: {res_json}")
+                                                successful_policies.add(pol_num)
                                                 continue
                                         except urllib.error.HTTPError as retry_e:
                                             e = retry_e
@@ -2453,8 +3234,10 @@ def main():
             import sys
             import logging
             import urllib.request
-            import urllib.error
-            from dotenv import load_dotenv
+            try:
+                from dotenv import load_dotenv
+            except ImportError:
+                def load_dotenv(*args, **kwargs): pass
 
             other_script_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "policy_commission_import_validation_script"))
             other_env_path = os.path.join(other_script_dir, ".env")
@@ -2476,7 +3259,7 @@ def main():
                 api_base = os.environ.get("API_BASE_URL", "https://prod.api.pieq.ai").rstrip("/")
                 sso_url_raw = os.environ.get("AUTH_URL", "https://prod.auth.pieq.ai")
                 sso_url = f"{sso_url_raw.rstrip('/')}/realms/pieq-sso/protocol/openid-connect/token"
-                client_id = os.environ.get("KEYCLOAK_CLIENT_ID", "pieq-app")
+                client_id = os.environ.get("KEYCLOAK_CLIENT_ID") or os.environ.get("client_id") or "pieq-app"
                 username = os.environ.get("USERNAME")
                 password = os.environ.get("PASSWORD")
                 
@@ -2501,6 +3284,7 @@ def main():
                         if action == "yes":
                             rule_uuid = payload_to_send.pop("rule_uuid") # Extract and remove from body
                             pol_num = payload_to_send.pop("policyNumber", "Unknown") # Remove helper field before sending
+                            payload_to_send.pop("writingAgentName", None)
                             put_url = f"{api_base}/api/v1/policy/commission/{rule_uuid}"
                             headers = {
                                 "Content-Type": "application/json",
@@ -2522,6 +3306,7 @@ def main():
                                     res_bytes = resp.read()
                                     res_json = json.loads(res_bytes.decode("utf-8"))
                                     logger.info(f"✅ Success PUT updating {pol_num} at {put_url}")
+                                    successful_policies.add(pol_num)
                             except urllib.error.HTTPError as e:
                                 if e.code == 401:
                                     logger.warning(f"⚠️ Token expired (HTTP 401). Re-fetching token and retrying PUT for {pol_num}...")
@@ -2539,6 +3324,7 @@ def main():
                                                 res_bytes = resp.read()
                                                 res_json = json.loads(res_bytes.decode("utf-8"))
                                                 logger.info(f"✅ Success PUT updating {pol_num} at {put_url} after token refresh")
+                                                successful_policies.add(pol_num)
                                                 continue
                                         except urllib.error.HTTPError as retry_e:
                                             e = retry_e
@@ -2562,6 +3348,48 @@ def main():
                 print(f"⚠️ Could not import API logic from {other_script_dir}. ({ie})")
             except Exception as e:
                 print(f"⚠️ API Auto-Update failed: {e}")
+
+    if successful_policies:
+        pol_col_s2 = next((c for c in df_stage2_unmatched.columns if str(c).strip().lower() in ("policy no", "policy number", "policy", "policyno", "policy_number")), None)
+        if pol_col_s2:
+            df_updated = df_stage2_unmatched[df_stage2_unmatched[pol_col_s2].astype(str).isin([str(p) for p in successful_policies])].copy()
+            if not df_updated.empty:
+                df_updated["Stage2_Status"] = "MATCHED (AUTO_UPDATED)"
+                df_updated["Stage2_Unmatched_Reason"] = "Successfully updated via API"
+                out_path = os.path.join(output_dir, f"db_verification_auto_updated_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+                df_updated.to_excel(out_path, index=False)
+                print(f"\n✅ Created Auto-Updated DB Match File with {len(df_updated)} rows: {out_path}")
+
+        # Fetch latest post-update DB commission snapshot directly from database
+        print("\n" + "="*80)
+        print("🔄 FETCHING LATEST POST-UPDATE POLICY COMMISSIONS FROM DATABASE...")
+        print("="*80)
+        try:
+            db_mgr_post = DatabaseManager()
+            if db_mgr_post.connect():
+                users_map_post = db_mgr_post.fetch_all_users_map(agency_id)
+                df_post_snapshot = fetch_db_commission_snapshot(
+                    df_stage1_valid=df_stage1_valid,
+                    db_mgr=db_mgr_post,
+                    agency_id=agency_id,
+                    users_map=users_map_post,
+                )
+                if not df_post_snapshot.empty:
+                    post_snapshot_path = export_db_commission_snapshot(
+                        df_snapshot=df_post_snapshot,
+                        versioned_dir=output_dir,
+                        df_stage1_valid=df_stage1_valid,
+                        filename_prefix="db_commission_snapshot_post_update",
+                    )
+                    post_pol_col = next((c for c in df_post_snapshot.columns if str(c).strip().lower() in ("policy no", "policy number", "policy", "policyno", "policy_number")), None)
+                    post_unique_pols = df_post_snapshot[post_pol_col].nunique() if post_pol_col else 0
+                    print(f"   ✅ Post-Update DB Snapshot: {len(df_post_snapshot):,} split rows across {post_unique_pols:,} policies.")
+                    print(f" 📁 Post-Update DB Commission Snapshot File: {post_snapshot_path}")
+                db_mgr_post.close()
+            else:
+                print("   ⚠️ Could not connect to DB for post-update snapshot.")
+        except Exception as pe:
+            print(f"   ⚠️ Error fetching post-update DB snapshot: {pe}")
 
 if __name__ == "__main__":
     main()
