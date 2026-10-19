@@ -1,0 +1,8 @@
+# Public PyPI. The machine index is CodeArtifact, and an expired token
+# returns 401 and reports that no package versions exist.
+--index-url https://pypi.org/simple
+
+psycopg[binary]>=3.1
+pandas
+numpy
+openpyxl
