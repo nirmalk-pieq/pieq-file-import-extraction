@@ -461,6 +461,133 @@ def unpivot_product_commission_rates(excel_path: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # SEQUENCE DIFFERENTIAL ROLL-UP & SPLIT NORMALIZATION (normalize_commission_splits.py)
 # ---------------------------------------------------------------------------
+_OPEN_MONTH = 10 ** 9
+
+
+def _is_main_line_benefits(name) -> bool:
+    key = " ".join(str(name or "").lower().split())
+    return key in ("main line benefits", "mlb parallel run", "mlb") or key.startswith("main line benefit")
+
+
+def _month_bound(val, default: int) -> int:
+    try:
+        return int(float(str(val).strip().replace("'", "").replace('"', "")))
+    except (ValueError, TypeError):
+        return default
+
+
+def align_split_month_bands(df: pd.DataFrame) -> pd.DataFrame:
+    """Split overlapping month ranges so every role in a band shares the same From and To.
+
+    A wider row keeps its own rate and is copied into each narrower band it covers.
+    A non-Main-Line-Benefits row with no rate and no amount is not a split.
+    """
+    if df is None or df.empty:
+        return df
+
+    pol_col = next((c for c in df.columns if str(c).strip().lower() in ("policy no", "policy number", "policy", "policyno", "policy_number")), None)
+    prod_col = next((c for c in df.columns if str(c).strip().lower() in ("product", "product name", "product_description", "product_name")), None)
+    fm_col = next((c for c in df.columns if str(c).strip().lower() in ("from month", "from_month", "month", "month from", "month_from")), None)
+    tm_col = next((c for c in df.columns if str(c).strip().lower() in ("to month", "to_month", "month to", "month_to")), None)
+    seq_col = next((c for c in df.columns if str(c).strip().lower() in ("sequence", "seq")), None)
+    rate_col = next((c for c in df.columns if str(c).strip().lower() in ("rate", "rate %", "commission %")), None)
+    amt_col = next((c for c in df.columns if str(c).strip().lower() in ("amount", "fee amount", "fee_amount")), None)
+    agent_name_col = next((c for c in df.columns if "agent name" in str(c).strip().lower() or str(c).strip().lower() == "agent_name"), None)
+
+    if not pol_col or not fm_col:
+        return df
+
+    buckets = {}
+    order_keys = []
+    for _, row in df.iterrows():
+        pol = " ".join(str(row.get(pol_col, "")).strip().strip("'\"").upper().split())
+        prod = " ".join(str(row.get(prod_col, "")).strip().strip("'\"").upper().split()) if prod_col else ""
+        key = (pol, prod)
+        if key not in buckets:
+            buckets[key] = []
+            order_keys.append(key)
+        buckets[key].append(row)
+
+    out_rows = []
+    for key in order_keys:
+        parsed = []
+        for row in buckets[key]:
+            fm = _month_bound(row.get(fm_col), 1)
+            tm = _month_bound(row.get(tm_col), 0) if tm_col else 0
+            if fm <= 0:
+                fm = 1
+            end = _OPEN_MONTH if tm <= 0 else tm + 1
+            rate = parse_rate(row.get(rate_col, 0.0)) if rate_col else 0.0
+            amt = parse_amount(row.get(amt_col, 0.0)) if amt_col else 0.0
+            seq_raw = row.get(seq_col, 1) if seq_col else 1
+            try:
+                seq = int(float(str(seq_raw).strip()))
+            except (ValueError, TypeError):
+                seq = 1
+            parsed.append({
+                "row": row,
+                "fm": fm,
+                "end": end,
+                "rate": rate,
+                "amt": amt,
+                "is_mlb": _is_main_line_benefits(row.get(agent_name_col, "") if agent_name_col else ""),
+                "seq": seq,
+            })
+
+        kept = list(parsed)
+        if not kept:
+            out_rows.extend(item["row"] for item in parsed)
+            continue
+
+        points = set()
+        for item in kept:
+            points.add(item["fm"])
+            if item["end"] < _OPEN_MONTH:
+                points.add(item["end"])
+        points = sorted(points)
+
+        segments = []
+        for i, start in enumerate(points):
+            if i + 1 < len(points):
+                segments.append((start, points[i + 1]))
+            elif any(item["fm"] <= start < item["end"] for item in kept):
+                segments.append((start, max(item["end"] for item in kept if item["fm"] <= start < item["end"])))
+
+        emitted = False
+        for start, end in segments:
+            if end <= start:
+                continue
+            covering = [item for item in kept if item["fm"] <= start and item["end"] >= end]
+            chosen = {}
+            for item in covering:
+                span = item["end"] - item["fm"]
+                current = chosen.get(item["seq"])
+                if current is None or span < current[0]:
+                    chosen[item["seq"]] = (span, item)
+            positive_other = any(
+                (not other["is_mlb"]) and (other["rate"] > 0 or other["amt"] > 0)
+                for other in covering
+            )
+            positive_mlb = any(other["is_mlb"] and (other["rate"] > 0 or other["amt"] > 0) for other in covering)
+            for seq in sorted(chosen):
+                item = chosen[seq][1]
+                zero_other = (not item["is_mlb"]) and item["rate"] <= 0 and item["amt"] <= 0
+                if zero_other and (positive_other or not positive_mlb):
+                    continue
+                new_row = item["row"].copy()
+                new_row[fm_col] = int(start)
+                if tm_col:
+                    new_row[tm_col] = 0 if end >= _OPEN_MONTH else int(end - 1)
+                out_rows.append(new_row)
+                emitted = True
+        if not emitted:
+            out_rows.extend(item["row"] for item in parsed)
+
+    if not out_rows:
+        return df.iloc[0:0].copy()
+    return pd.DataFrame(out_rows).reset_index(drop=True)
+
+
 def rollup_commission_splits(df: pd.DataFrame) -> pd.DataFrame:
     """
     Performs sequence differential roll-up and percentage split normalization.
@@ -472,7 +599,8 @@ def rollup_commission_splits(df: pd.DataFrame) -> pd.DataFrame:
 
     pol_col = next((c for c in df_out.columns if str(c).strip().lower() in ("policy no", "policy number", "policy", "policyno", "policy_number")), None)
     prod_col = next((c for c in df_out.columns if str(c).strip().lower() in ("product", "product name", "product_description", "product_name")), None)
-    fm_col = next((c for c in df_out.columns if str(c).strip().lower() in ("from month", "from_month", "month")), None)
+    fm_col = next((c for c in df_out.columns if str(c).strip().lower() in ("from month", "from_month", "month", "month from", "month_from")), None)
+    tm_col = next((c for c in df_out.columns if str(c).strip().lower() in ("to month", "to_month", "month to", "month_to")), None)
     seq_col = next((c for c in df_out.columns if str(c).strip().lower() in ("sequence", "seq")), None)
     rate_col = next((c for c in df_out.columns if str(c).strip().lower() in ("rate", "rate %", "commission %")), None)
     amt_col = next((c for c in df_out.columns if str(c).strip().lower() in ("amount", "fee amount", "fee_amount")), None)
@@ -492,12 +620,15 @@ def rollup_commission_splits(df: pd.DataFrame) -> pd.DataFrame:
     df_out["_pol_clean"] = clean_key(df_out[pol_col])
     df_out["_prod_clean"] = clean_key(df_out[prod_col]) if prod_col else ""
     df_out["_fm_clean"] = clean_key(df_out[fm_col]) if fm_col else ""
+    df_out["_tm_clean"] = clean_key(df_out[tm_col]) if tm_col else ""
 
     group_cols = ["_pol_clean"]
     if prod_col:
         group_cols.append("_prod_clean")
     if fm_col:
         group_cols.append("_fm_clean")
+    if tm_col:
+        group_cols.append("_tm_clean")
 
     grouped = df_out.groupby(group_cols, sort=False)
 
@@ -530,13 +661,9 @@ def rollup_commission_splits(df: pd.DataFrame) -> pd.DataFrame:
             # FIXED FEE ($) — Differential Amounts & 100% Split Shares
             adj_amounts = []
             for s, a in zip(seqs, amounts):
-                if a > 0:
-                    prev_seq = s - 1
-                    if prev_seq in seq_amt_map:
-                        prev_amt = seq_amt_map[prev_seq]
-                        adj_amounts.append(max(0.0, a - prev_amt))
-                    else:
-                        adj_amounts.append(a)
+                prev_amt = seq_amt_map.get(s - 1)
+                if a > 0 and prev_amt is not None and prev_amt > 0:
+                    adj_amounts.append(max(0.0, a - prev_amt))
                 else:
                     adj_amounts.append(a)
 
@@ -577,9 +704,8 @@ def rollup_commission_splits(df: pd.DataFrame) -> pd.DataFrame:
             # PERCENTAGE (%) — Differential Rates & 100% Split Shares
             rate_diffs = []
             for s, r in zip(seqs, rates):
-                prev_seq = s - 1
-                if prev_seq in seq_rate_map:
-                    prev_r = seq_rate_map[prev_seq]
+                prev_r = seq_rate_map.get(s - 1)
+                if prev_r is not None and prev_r > 0:
                     rate_diffs.append(max(0.0, r - prev_r) if r > prev_r else r)
                 else:
                     rate_diffs.append(r)
@@ -624,7 +750,7 @@ def rollup_commission_splits(df: pd.DataFrame) -> pd.DataFrame:
     df_out["Carrier Commission"] = res_carrier_comm
     df_out["Payout Method"] = res_payout_method
 
-    df_out = df_out.drop(columns=["_amt_num", "_rate_num", "_seq_num", "_pol_clean", "_prod_clean", "_fm_clean"], errors="ignore")
+    df_out = df_out.drop(columns=["_amt_num", "_rate_num", "_seq_num", "_pol_clean", "_prod_clean", "_fm_clean", "_tm_clean"], errors="ignore")
     return df_out
 
 
@@ -642,7 +768,8 @@ def stage1_pre_validate_dataset(
     Stage 1: Applies sequence rollups and validates carrier rates against master rate sheet.
     Returns: (df_stage1_valid, df_stage1_invalid, summary_dict)
     """
-    df_norm_splits = rollup_commission_splits(df_comm)
+    df_aligned = align_split_month_bands(df_comm)
+    df_norm_splits = rollup_commission_splits(df_aligned)
     df_out = df_norm_splits.copy()
 
     # Enrich / normalize Agent ID whenever Agent Name matches in agent_roster_dict
@@ -747,7 +874,7 @@ def stage1_pre_validate_dataset(
         # -------------------------------------------------------------------
         if agent_name_col:
             agent_name_raw = " ".join(str(seq_1_row.get(agent_name_col, "")).lower().split())
-            if agent_name_raw in ("main line benefits", "mlb parallel run", "mlb"):
+            if agent_name_raw in ("main line benefits", "mlb parallel run", "mlb") and 3 <= len(indices) <= 4:
                 valid_count += len(indices)
                 for idx in indices:
                     validation_statuses[idx] = "VALID"
@@ -795,7 +922,14 @@ def stage1_pre_validate_dataset(
         # CHECK 2: Policy Split Row Count Verification (3 to 4 rows per policy)
         # -------------------------------------------------------------------
         row_count = len(indices)
-        if row_count < 3 or row_count > 4:
+        shares_for_count = [float(group.loc[idx, "Normalized_Split_Share_%"]) for idx in indices]
+        agency_with_zero_partner = (
+            row_count == 2
+            and abs(round(sum(shares_for_count), 2) - 100.00) <= 0.05
+            and any(abs(share) <= 0.05 for share in shares_for_count)
+            and any(abs(share - 100.0) <= 0.05 for share in shares_for_count)
+        )
+        if (row_count < 3 or row_count > 4) and not agency_with_zero_partner:
             for idx in indices:
                 validation_statuses[idx] = "INVALID_POLICY_ROW_COUNT"
                 expected_values[idx] = "3 to 4 split rows"
@@ -893,7 +1027,7 @@ def stage1_pre_validate_dataset(
     df_out["Stage1_Expected_Commission"] = expected_values
     df_out["Stage1_Error_Reason"] = error_reasons
 
-    df_out = df_out.drop(columns=["_pol_clean", "_prod_clean", "_fm_clean"], errors="ignore")
+    df_out = df_out.drop(columns=["_pol_clean", "_prod_clean", "_fm_clean", "_tm_clean"], errors="ignore")
 
     valid_mask = df_out["Stage1_Status"] == "VALID"
     zero_mask = df_out["Stage1_Status"] == "ZERO_COMM_IGNORED"
@@ -902,14 +1036,7 @@ def stage1_pre_validate_dataset(
     
     df_stage1_valid = df_out[valid_mask].copy()
     df_stage1_zero = df_out[zero_mask].copy()
-    
-    # Grab the original raw rows from df_comm for errors
-    df_stage1_invalid = df_comm[invalid_mask].copy()
-    
-    # Attach just the error context columns back to the raw rows
-    df_stage1_invalid["Stage1_Status"] = df_out.loc[invalid_mask, "Stage1_Status"]
-    df_stage1_invalid["Stage1_Expected_Commission"] = df_out.loc[invalid_mask, "Stage1_Expected_Commission"]
-    df_stage1_invalid["Stage1_Error_Reason"] = df_out.loc[invalid_mask, "Stage1_Error_Reason"]
+    df_stage1_invalid = df_out[invalid_mask].copy()
 
     summary = {
         "total_input_records": len(df_comm),
@@ -1480,6 +1607,47 @@ def build_file_commission_split(group: pd.DataFrame, seq_col, agent_col, agent_n
     # Sort descending by sequence (highest seq = order 1 = Agency), matching import script logic
     raw_items.sort(key=lambda x: x["sequence"], reverse=True)
 
+    if len(raw_items) == 2:
+        agency_item = next((item for item in raw_items if _is_main_line_benefits(item["user_name"])), None)
+        other_item = next((item for item in raw_items if item is not agency_item), None)
+        if (
+            agency_item is not None
+            and other_item is not None
+            and abs(float(agency_item["commission_value"]) - 100.0) <= 0.05
+            and abs(float(other_item["commission_value"])) <= 0.05
+        ):
+            person_level = normalize_level(other_item["contract"]) or "Agent"
+            return [
+                {
+                    "order": 1,
+                    "role": "Agency",
+                    "user_name": agency_item["user_name"],
+                    "user_code": "",
+                    "commission_value": 100.0,
+                    "entity": "agency",
+                    "level": "",
+                    "user_uuid": "62a97a01-2801-4c7c-9cd0-cf38f2e0a4f4",
+                },
+                {
+                    "order": 2,
+                    "role": "Sales Leader",
+                    "user_name": other_item["user_name"],
+                    "user_code": other_item["user_code"],
+                    "commission_value": 0.0,
+                    "entity": "agent",
+                    "level": "Sales Leader",
+                },
+                {
+                    "order": 3,
+                    "role": "Agent",
+                    "user_name": other_item["user_name"],
+                    "user_code": other_item["user_code"],
+                    "commission_value": 0.0,
+                    "entity": "agent",
+                    "level": person_level if person_level.lower() not in ("broker", "sales leader") else "Agent",
+                },
+            ]
+
     commission_split = []
     for order_idx, item in enumerate(raw_items):
         order = order_idx + 1
@@ -1525,6 +1693,325 @@ def build_file_commission_split(group: pd.DataFrame, seq_col, agent_col, agent_n
 
     return commission_split
 
+
+def month_number(month) -> Optional[int]:
+    """Integer month, or None when the value is blank or open-ended."""
+    if month is None:
+        return None
+    text = str(month).strip()
+    if text.lower() in ("", "none", "null", "nan"):
+        return None
+    try:
+        number = int(float(text))
+    except (TypeError, ValueError):
+        return None
+    if number == 0:
+        return None
+    return number
+
+
+def prefix_month_with_999(month) -> Optional[int]:
+    """Prefix a month with 999. 1 becomes 9991 and 13 becomes 99913. None stays None."""
+    number = month_number(month)
+    if number is None:
+        return None
+    digits = str(number)
+    if digits.startswith("999"):
+        return number
+    return int("999" + digits)
+
+
+def payout_method_code(raw) -> int:
+    if (isinstance(raw, int) and raw == 1) or str(raw).strip() in ("1", "FIXED FEE", "FIXED_FEE"):
+        return 1
+    return 2
+
+
+def _as_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def json_copy(value):
+    return json.loads(json.dumps(value, default=str))
+
+
+def enrich_split_user_uuids(file_commission_split, db_user_map, db_mgr, agency_id: int) -> list:
+    """Fill missing split user UUIDs from the agency user map, then the database."""
+    sanitized_splits = []
+    for split_item in file_commission_split or []:
+        s_item = split_item.copy()
+        c_val = float(s_item.get("commission_value") or 0.0)
+        s_item["commission_value"] = max(0.0, c_val)
+        if not s_item.get("user_uuid"):
+            u_code = str(s_item.get("user_code") or "").strip().lower()
+            u_name = " ".join(str(s_item.get("user_name") or "").strip().lower().split())
+            fetched_uuid = db_user_map.get(u_code) if u_code else None
+            if not fetched_uuid and u_name:
+                fetched_uuid = db_user_map.get(u_name)
+            if not fetched_uuid and (u_code or u_name):
+                fetched_uuid = db_mgr.get_user_uuid(
+                    agency_id, user_code=s_item.get("user_code"), user_name=s_item.get("user_name")
+                )
+                if u_code:
+                    db_user_map[u_code] = fetched_uuid
+                if u_name:
+                    db_user_map[u_name] = fetched_uuid
+            if fetched_uuid:
+                s_item["user_uuid"] = fetched_uuid
+        sanitized_splits.append(s_item)
+    return sanitized_splits
+
+
+def build_file_tier_post_payload(
+    policy_uuid,
+    policy_number,
+    writing_name,
+    month_from,
+    month_to,
+    fee_val,
+    payout_code,
+    file_commission_split,
+    db_user_map,
+    db_mgr,
+    agency_id: int,
+) -> dict:
+    """POST body for one file month tier, with the file's original months."""
+    return {
+        "policyUuid": policy_uuid,
+        "policyNumber": policy_number,
+        "writingAgentName": writing_name,
+        "ruleName": "Carrier - Product - COMMISSION",
+        "version": 1,
+        "commissionType": 1,
+        "paymentFrequency": 1,
+        "payoutMethod": payout_code,
+        "monthFrom": month_from,
+        "monthTo": month_to,
+        "feeAmount": fee_val,
+        "premiumAmount": 0.0,
+        "commissionSplit": enrich_split_user_uuids(file_commission_split, db_user_map, db_mgr, agency_id),
+    }
+
+
+def build_existing_month_archive_payload(rec: dict) -> Optional[dict]:
+    """PUT body that keeps an existing rule and prefixes its months with 999."""
+    rule_uuid = str(rec.get("commission_uuid") or rec.get("uuid") or "").strip()
+    if not rule_uuid or rule_uuid.lower() in ("none", "null"):
+        return None
+    old_from = month_number(rec.get("month_from"))
+    old_to = month_number(rec.get("month_to"))
+    new_from = prefix_month_with_999(old_from)
+    new_to = prefix_month_with_999(old_to)
+    if new_from == old_from and new_to == old_to:
+        return None
+    splits = rec.get("commission_split")
+    if isinstance(splits, str) and splits.strip():
+        try:
+            splits = json.loads(splits)
+        except json.JSONDecodeError:
+            splits = []
+    if not isinstance(splits, list):
+        splits = []
+    old_to_label = old_to if old_to is not None else "None"
+    new_to_label = new_to if new_to is not None else "None"
+    return {
+        "rule_uuid": rule_uuid,
+        "policyNumber": str(rec.get("policy_number") or ""),
+        "policyUuid": str(rec.get("policy_uuid") or ""),
+        "writingAgentName": rec.get("_writing_agent_name") or "",
+        "ruleName": rec.get("rule_name") or "Carrier - Product - COMMISSION",
+        "version": _as_int(rec.get("version"), 1),
+        "commissionType": _as_int(rec.get("commission_type"), 1),
+        "paymentFrequency": _as_int(rec.get("payment_frequency"), 1),
+        "payoutMethod": payout_method_code(rec.get("payout_method")),
+        "monthFrom": new_from,
+        "monthTo": new_to,
+        "feeAmount": float(rec.get("fee_amount") or 0.0),
+        "premiumAmount": float(rec.get("premium_amount") or 0.0),
+        "commissionSplit": json_copy(splits),
+        "_diff_text": f"   Period: {old_from}-{old_to_label} -> {new_from}-{new_to_label}",
+    }
+
+
+def _api_auth_headers(token: str) -> dict:
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    if "X_CLIENT_ID" in os.environ:
+        headers["x-client-id"] = os.environ["X_CLIENT_ID"]
+    if "X_SERVICE_NAME" in os.environ:
+        headers["x-service-name"] = os.environ["X_SERVICE_NAME"]
+    return headers
+
+
+def _send_commission_request(logger, url: str, body: dict, headers: dict, method: str, pol_num: str, refresh_token) -> bool:
+    """Send one commission API call. refresh_token() returns a new bearer token or None."""
+    import urllib.request
+    import urllib.error
+
+    def attempt():
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=30.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        res_json = attempt()
+        logger.info(f"✅ Success {method} {pol_num} at {url}: {res_json}")
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            logger.warning(f"⚠️ Token expired (HTTP 401). Re-fetching token and retrying {method} for {pol_num}...")
+            new_token = refresh_token()
+            if new_token:
+                headers["Authorization"] = f"Bearer {new_token}"
+                try:
+                    res_json = attempt()
+                    logger.info(f"✅ Success {method} {pol_num} at {url} after token refresh: {res_json}")
+                    return True
+                except urllib.error.HTTPError as retry_e:
+                    e = retry_e
+                except Exception as retry_err:
+                    logger.error(f"❌ Failed to {method} {pol_num} on retry: {retry_err}")
+                    return False
+        err_body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else str(e)
+        logger.error(f"❌ Failed to {method} {pol_num} at {url} (HTTP {getattr(e, 'code', 'Error')}): {err_body}")
+        return False
+    except Exception as err:
+        logger.error(f"❌ Failed to {method} {pol_num}: {err}")
+        return False
+
+
+def execute_month_archive_and_full_post(archive_payloads: list, full_file_payloads: list, successful_policies: set) -> None:
+    """Move existing commission months to the 999 range, then POST every valid file tier."""
+    import logging
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        def load_dotenv(*args, **kwargs):
+            pass
+
+    other_script_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "policy_commission_import_validation_script"))
+    other_env_path = os.path.join(other_script_dir, ".env")
+    if os.path.exists(other_env_path):
+        load_dotenv(other_env_path, override=False)
+    if other_script_dir not in sys.path:
+        sys.path.append(other_script_dir)
+
+    try:
+        from import_policy_commission import fetch_sso_token, confirm_payload
+    except ImportError as ie:
+        print(f"⚠️ Could not import API logic from {other_script_dir}. ({ie})")
+        return
+
+    logger = logging.getLogger("MonthArchiveImport")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        logger.addHandler(logging.StreamHandler())
+
+    api_base = os.environ.get("API_BASE_URL", "https://prod.api.pieq.ai").rstrip("/")
+    sso_url_raw = os.environ.get("AUTH_URL", "https://prod.auth.pieq.ai")
+    sso_url = f"{sso_url_raw.rstrip('/')}/realms/pieq-sso/protocol/openid-connect/token"
+    client_id = os.environ.get("KEYCLOAK_CLIENT_ID") or os.environ.get("client_id") or "pieq-app"
+    username = os.environ.get("USERNAME")
+    password = os.environ.get("PASSWORD")
+    token = fetch_sso_token(logger, sso_url, client_id, username, password)
+    if not token:
+        print("⚠️ Could not generate API token. Make sure .env credentials are set.")
+        return
+
+    headers = _api_auth_headers(token)
+
+    def refresh_token():
+        return fetch_sso_token(logger, sso_url, client_id, username, password)
+
+    blocked_policies = set()
+    auto_confirm = False
+    if archive_payloads:
+        print("\n" + "=" * 80)
+        print(f"📦 MONTH ARCHIVE: {len(archive_payloads)} existing commission rule(s) will be moved to 999 month ranges.")
+        print("=" * 80)
+    for idx, payload in enumerate(archive_payloads):
+        payload_to_send = payload.copy()
+        diff_text = payload_to_send.pop("_diff_text", "")
+        action = confirm_payload(
+            logger, idx + 1, len(archive_payloads), payload_to_send, auto_confirm, action_name="PUT", diff_text=diff_text
+        )
+        if action == "quit":
+            print("⏩ Stopped month archive. File tiers for this choice will not be posted.")
+            return
+        if action == "all":
+            auto_confirm = True
+            action = "yes"
+        elif action == "skip":
+            blocked_policies.add(str(payload.get("policyNumber") or ""))
+            continue
+        if action != "yes":
+            continue
+        rule_uuid = payload_to_send.pop("rule_uuid", None)
+        pol_num = payload_to_send.pop("policyNumber", "Unknown")
+        payload_to_send.pop("writingAgentName", None)
+        ok = _send_commission_request(
+            logger,
+            f"{api_base}/api/v1/policy/commission/{rule_uuid}",
+            payload_to_send,
+            headers,
+            "PUT",
+            pol_num,
+            refresh_token,
+        )
+        if not ok:
+            blocked_policies.add(str(pol_num))
+
+    post_payloads = [p for p in full_file_payloads if str(p.get("policyNumber") or "") not in blocked_policies]
+    skipped = len(full_file_payloads) - len(post_payloads)
+    if skipped:
+        print(f"⏩ Skipped {skipped} file tier(s) because their existing commission months were not archived.")
+    if not post_payloads:
+        return
+
+    print("\n" + "=" * 80)
+    print(f"📤 FULL FILE POST: {len(post_payloads)} file commission tier(s) will be created with their original months.")
+    print("=" * 80)
+    auto_confirm = False
+    for idx, payload in enumerate(post_payloads):
+        payload_to_send = payload.copy()
+        action = confirm_payload(logger, idx + 1, len(post_payloads), payload_to_send, auto_confirm, action_name="POST")
+        if action == "quit":
+            break
+        if action == "all":
+            auto_confirm = True
+            action = "yes"
+        elif action == "skip":
+            continue
+        if action != "yes":
+            continue
+        pol_num = payload_to_send.pop("policyNumber", "Unknown")
+        payload_to_send.pop("writingAgentName", None)
+        payload_to_send.pop("rule_uuid", None)
+        payload_to_send.pop("_diff_text", None)
+        payload_to_send.pop("_issue_reason", None)
+        ok = _send_commission_request(
+            logger,
+            f"{api_base}/api/v1/policy/commission",
+            [payload_to_send],
+            headers,
+            "POST",
+            pol_num,
+            refresh_token,
+        )
+        if ok:
+            successful_policies.add(pol_num)
+
+
 def stage2_db_verify_dataset(
     df_valid: pd.DataFrame,
     db_mgr: DatabaseManager,
@@ -1539,7 +2026,7 @@ def stage2_db_verify_dataset(
     Returns: (matched_df, ambiguous_df, unmatched_df, missing_policy_payloads)
     """
     if df_valid.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), [], [], []
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), [], [], [], [], [], []
 
     df_out = df_valid.copy().reset_index(drop=True)
 
@@ -1567,6 +2054,9 @@ def stage2_db_verify_dataset(
     missing_policy_payloads = []
     mismatch_policy_payloads = []
     invalid_user_uuid_payloads = []
+    file_tier_results = {}
+    file_tier_issues = {}
+    existing_rules_by_policy = {}
 
     grouped = df_out.groupby([pol_col, prod_col], sort=False) if pol_col and prod_col else df_out.groupby(df_out.index)
     group_items = list(grouped)
@@ -1607,6 +2097,35 @@ def stage2_db_verify_dataset(
         if not isinstance(record, dict):
             return ""
         return db_mgr.format_writing_agent(record.get("writing_agent_user_id"))
+
+    def remember_existing_rules(policy_uuid, policy_number, writing_name, records):
+        if not policy_uuid or policy_uuid in existing_rules_by_policy:
+            return
+        kept = []
+        seen_rules = set()
+        for rec in records or []:
+            rule_id = str(rec.get("commission_uuid") or rec.get("uuid") or "").strip()
+            if not rule_id or rule_id.lower() in ("none", "null") or rule_id in seen_rules:
+                continue
+            seen_rules.add(rule_id)
+            stamped = dict(rec)
+            stamped["commission_uuid"] = rule_id
+            stamped["policy_uuid"] = policy_uuid
+            stamped["policy_number"] = policy_number
+            stamped["_writing_agent_name"] = writing_name
+            kept.append(stamped)
+        existing_rules_by_policy[policy_uuid] = kept
+
+    def queue_file_tier(payload):
+        key = (payload.get("policyUuid"), payload.get("monthFrom"), payload.get("monthTo"))
+        issues = commission_payload_issues(payload)
+        if issues:
+            if key not in file_tier_results or file_tier_results[key] is None:
+                file_tier_results[key] = None
+                file_tier_issues[key] = issues
+            return
+        file_tier_results[key] = payload
+        file_tier_issues.pop(key, None)
 
     # Pre-fetch ALL products, policies, and policy_commission rules in 1 single bulk SQL query
     chunk_db_map = {}
@@ -1729,6 +2248,13 @@ def stage2_db_verify_dataset(
                     if not comm_records:
                         not_found_commissions.add(found_pol_uuid)
 
+                remember_existing_rules(
+                    found_pol_uuid,
+                    pol_number,
+                    writing_agent_name_for(db_records[0] if db_records else None),
+                    comm_records,
+                )
+
                 if not comm_records:
                     unmatched_count += len(indices)
                     for idx in indices:
@@ -1822,6 +2348,7 @@ def stage2_db_verify_dataset(
                             "premiumAmount": prem_val,
                             "commissionSplit": sanitized_splits
                         }
+                        queue_file_tier(missing_payload)
                         
                         split_issues = commission_payload_issues(missing_payload)
                         if split_issues:
@@ -1880,6 +2407,20 @@ def stage2_db_verify_dataset(
                         else:
                             _file_fee_val = parse_rate(_carrier_comm_raw)
                             _file_payout_method_code = 2
+
+                        queue_file_tier(build_file_tier_post_payload(
+                            found_pol_uuid,
+                            pol_number,
+                            writing_agent_name_for(db_records[0] if db_records else None),
+                            file_fm,
+                            expected_db_tm,
+                            _file_fee_val,
+                            _file_payout_method_code,
+                            file_commission_split,
+                            db_user_map,
+                            db_mgr,
+                            agency_id,
+                        ))
 
                         match_found = False
                         unmatched_agent = False
@@ -2265,7 +2806,51 @@ def stage2_db_verify_dataset(
             seen_mismatches.add(mp["rule_uuid"])
             unique_mismatch_payloads.append(mp)
 
-    return df_matched, df_ambiguous, df_unmatched, unique_missing_payloads, unique_mismatch_payloads, invalid_user_uuid_payloads
+    target_policies = {}
+    for mp in unique_missing_payloads + unique_mismatch_payloads:
+        target_policies[mp.get("policyUuid")] = mp.get("policyNumber")
+
+    archive_payloads = []
+    full_file_payloads = []
+    archive_ineligible_notes = []
+    seen_archive_rules = set()
+    for policy_uuid, policy_number in target_policies.items():
+        tier_keys = [key for key in file_tier_results if key[0] == policy_uuid]
+        failed_keys = [key for key in tier_keys if file_tier_results.get(key) is None]
+        if not tier_keys or failed_keys:
+            reasons = []
+            for key in failed_keys:
+                month_to = key[2] if key[2] is not None else "None"
+                reasons.append(
+                    f"{key[1]}->{month_to}: {'; '.join(file_tier_issues.get(key) or ['split validation failed'])}"
+                )
+            if not tier_keys:
+                reasons.append("no file tier payload was built")
+            archive_ineligible_notes.append(f"{policy_number or policy_uuid}: " + " | ".join(reasons))
+            continue
+        for rec in existing_rules_by_policy.get(policy_uuid, []):
+            archive_payload = build_existing_month_archive_payload(rec)
+            if not archive_payload or archive_payload["rule_uuid"] in seen_archive_rules:
+                continue
+            seen_archive_rules.add(archive_payload["rule_uuid"])
+            archive_payloads.append(archive_payload)
+        for key in tier_keys:
+            full_file_payloads.append(file_tier_results[key])
+
+    archive_payloads.sort(key=lambda item: (str(item.get("policyNumber")), item.get("monthFrom") or 0))
+    full_file_payloads.sort(key=lambda item: (str(item.get("policyNumber")), item.get("monthFrom") or 0))
+
+    return (
+        df_matched,
+        df_ambiguous,
+        df_unmatched,
+        unique_missing_payloads,
+        unique_mismatch_payloads,
+        invalid_user_uuid_payloads,
+        archive_payloads,
+        full_file_payloads,
+        archive_ineligible_notes,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2807,7 +3392,17 @@ def main():
     else:
         print("   ⚠️ Skipping DB snapshot (no active DB connection or dry-run mode).")
 
-    df_stage2_matched, df_stage2_ambiguous, df_stage2_unmatched, unique_missing_payloads, unique_mismatch_payloads, invalid_user_uuid_payloads = stage2_db_verify_dataset(
+    (
+        df_stage2_matched,
+        df_stage2_ambiguous,
+        df_stage2_unmatched,
+        unique_missing_payloads,
+        unique_mismatch_payloads,
+        invalid_user_uuid_payloads,
+        archive_payloads,
+        full_file_payloads,
+        archive_ineligible_notes,
+    ) = stage2_db_verify_dataset(
         df_valid=df_stage1_valid,
         db_mgr=db_mgr,
         agency_id=agency_id,
@@ -3107,6 +3702,31 @@ def main():
         print(f"⚠️ Failed to write markdown summary: {e}")
     print(f"\n📝 Validation summary markdown saved to: {md_summary_path}")
     successful_policies = set()
+
+    if archive_payloads or full_file_payloads:
+        archive_policy_count = len({item.get("policyUuid") for item in full_file_payloads})
+        print("\n" + "=" * 80)
+        print(
+            f"Move existing commission months to 999 for {archive_policy_count} policy(ies) "
+            f"({len(archive_payloads)} existing rule(s)), then post {len(full_file_payloads)} file tier(s)?"
+        )
+        print("Yes: 1 becomes 9991 and 13 becomes 99913. The file keeps its original months.")
+        print("No: create only missing tiers and update mismatched tiers in place.")
+        if archive_ineligible_notes:
+            print("These policies stay on the normal create/update path because a file tier failed split validation:")
+            for note in archive_ineligible_notes:
+                print(f"  - {note}")
+        print("=" * 80)
+        archive_choice = input("Move existing months to 999 and post the full file? (y/n): ").strip().lower()
+        if archive_choice in ("y", "yes"):
+            eligible_policy_ids = {item.get("policyUuid") for item in full_file_payloads}
+            unique_missing_payloads = [
+                item for item in unique_missing_payloads if item.get("policyUuid") not in eligible_policy_ids
+            ]
+            unique_mismatch_payloads = [
+                item for item in unique_mismatch_payloads if item.get("policyUuid") not in eligible_policy_ids
+            ]
+            execute_month_archive_and_full_post(archive_payloads, full_file_payloads, successful_policies)
 
     if unique_missing_payloads:
         print("\n" + "="*80)
