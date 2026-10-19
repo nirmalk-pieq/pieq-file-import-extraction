@@ -1,0 +1,27 @@
+# Production forecast config. Loaded with:
+#   python3 review_to_reconcile_file_forecast.py prod <commission_statement_uuid>
+# The script only SELECTs from the database and never POSTs or PUTs to the API base URL.
+
+PIEQ_API_BASE_URL=https://prod.api.pieq.ai
+
+# Keycloak SSO password grant. The token is requested at
+# {AUTH_URL}/realms/pieq-sso/protocol/openid-connect/token
+AUTH_URL=https://prod.auth.pieq.ai
+client_id=pieq-app
+USERNAME= nirmal.k+5@pieq.ai
+PASSWORD= Test@123
+grant_type=password
+
+# Source database. Read only. Username and password are separate from the host.
+PIEQ_DB_HOST=host_name
+PIEQ_DB_PORT=5432
+PIEQ_DB_NAME=production_database
+PIEQ_DB_USERNAME=user_name
+PIEQ_DB_PASSWORD=db_password
+
+# Carrier statement used to cross-check commission_detail_report.csv.
+# Use one file, or a folder whose file names match commission statement names.
+APL_STATEMENT_PATH=/Users/nirmalrajaak/Downloads/RPT_APL_STMT_CSV_3661_20261014_215438.CSV
+# APL_STATEMENT_DIR=/path/to/carrier_statements
+# APL drives by default. Set to icm to reverse and drive from forecast payables.
+APL_VALIDATION_MODE=icm
