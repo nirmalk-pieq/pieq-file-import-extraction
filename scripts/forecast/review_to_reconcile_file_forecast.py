@@ -67,6 +67,7 @@ TYPE_CHARGEBACK = "CHARGEBACK"
 TYPE_TRUE_UP = "TRUE_UP"
 TYPE_ARF = "ARF"
 TYPE_AGENCY_CREDIT = "AGENCY_CREDIT"
+TYPE_ADVANCE_EARNED = "ADVANCE_EARNED"
 DEBIT_TYPES = {"CHARGEBACK", "ADVANCE_RECOVERY", "AGENCY_DEBIT"}
 POLICY_STATUS_LABELS = {
     0: "Active",
@@ -1077,6 +1078,7 @@ SELECT DISTINCT ON (csr.id)
     p.effective_date AS policy_effective_date, p.carrier_id::text AS policy_carrier_id,
     p.product_id::text AS policy_product_uuid, p.pay_to_agent_user_id::text AS pay_to_agent_user_id,
     (p.id IS NOT NULL) AS policy_exists,
+    pa.uuid::text AS policy_advance_uuid,
     pa.initiated_by AS policy_advance_initiated_by,
     pa.process_advance AS policy_advance_process_advance,
     pa.process_commission AS policy_advance_process_commission,
@@ -1227,6 +1229,25 @@ SPLIT_BY_UUID_SQL = """
 SELECT uuid::text AS uuid, fee_amount, payout_method, commission_split, commission_type_text
 FROM policy_commission
 WHERE agency_id = %s AND uuid = %s::uuid
+"""
+
+AGENT_ADVANCE_BALANCE_SQL = """
+SELECT COALESCE(SUM(amount), 0) AS total
+FROM agent_advance_ledgers
+WHERE agency_id = %s
+  AND policy_uuid = %s::uuid
+  AND agent_uuid = %s::uuid
+"""
+
+HAS_RECOVERY_LEDGER_SQL = """
+SELECT EXISTS (
+    SELECT 1 FROM agent_advance_ledgers
+    WHERE agency_id = %s
+      AND policy_uuid = %s::uuid
+      AND agent_uuid = %s::uuid
+      AND commission_statement_record_uuid = %s::uuid
+      AND amount < 0
+) AS exists
 """
 
 
@@ -2712,9 +2733,110 @@ class Forecast:
                 "agency_id": record["agency_id"],
                 "policy_uuid": record.get("forecast_policy_uuid"),
                 "entity_uuid": entity_uuid,
+                "agent_uuid": entity_uuid,
                 "amount": amount,
                 "transaction_id": self.next_tx("ADV"),
             }
+        )
+
+    def get_agent_advance_outstanding(self, agency_id, policy_uuid, agent_uuid):
+        if not agency_id or not policy_uuid or not agent_uuid:
+            return Decimal("0.00")
+
+        db_total = Decimal("0.00")
+        if getattr(self, "conn", None):
+            try:
+                rows = self.select(
+                    AGENT_ADVANCE_BALANCE_SQL,
+                    (agency_id, str(policy_uuid), str(agent_uuid)),
+                )
+                if rows and rows[0].get("total") is not None:
+                    db_total = money(rows[0]["total"]) or Decimal("0.00")
+            except Exception:
+                pass
+
+        mem_total = Decimal("0.00")
+        for entry in getattr(self, "advance_ledgers", []):
+            if (
+                str(entry.get("agency_id")) == str(agency_id)
+                and str(entry.get("policy_uuid")) == str(policy_uuid)
+                and str(entry.get("agent_uuid") or entry.get("entity_uuid")) == str(agent_uuid)
+            ):
+                amt = money(entry.get("amount")) or Decimal("0.00")
+                mem_total += amt
+
+        total = db_total + mem_total
+        return total if total > Decimal("0.00") else Decimal("0.00")
+
+    def has_recovery_ledger(self, agency_id, policy_uuid, agent_uuid, statement_uuid):
+        if not agency_id or not policy_uuid or not agent_uuid or not statement_uuid:
+            return False
+
+        for entry in getattr(self, "advance_ledgers", []):
+            if (
+                str(entry.get("agency_id")) == str(agency_id)
+                and str(entry.get("policy_uuid")) == str(policy_uuid)
+                and str(entry.get("agent_uuid") or entry.get("entity_uuid")) == str(agent_uuid)
+                and str(entry.get("commission_statement_record_uuid") or entry.get("statement_uuid")) == str(statement_uuid)
+                and (money(entry.get("amount")) or Decimal("0.00")) < Decimal("0.00")
+            ):
+                return True
+
+        if getattr(self, "conn", None):
+            try:
+                rows = self.select(
+                    HAS_RECOVERY_LEDGER_SQL,
+                    (agency_id, str(policy_uuid), str(agent_uuid), str(statement_uuid)),
+                )
+                if rows and rows[0].get("exists"):
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    def calculate_agent_recovery_split(self, outstanding_balance, agent_split_amount):
+        normalized_split = abs(money(agent_split_amount) or Decimal("0.00"))
+        recovery_amount = min(outstanding_balance, normalized_split)
+        commission_amount = normalized_split - recovery_amount
+        return recovery_amount, commission_amount
+
+    def persist_recovery_entry(self, record, commission_uuid, line, recovery_amount):
+        if recovery_amount <= Decimal("0.00"):
+            return
+
+        agency_id = record["agency_id"]
+        policy_uuid = record.get("forecast_policy_uuid") or record.get("policy_uuid")
+        agent_uuid = line.get("user_uuid")
+        statement_uuid = record.get("uuid")
+        policy_advance_uuid = record.get("policy_advance_uuid")
+
+        if not self.has_recovery_ledger(agency_id, policy_uuid, agent_uuid, statement_uuid):
+            self.advance_ledgers.append(
+                {
+                    "uuid": new_id(),
+                    "agency_id": agency_id,
+                    "policy_uuid": policy_uuid,
+                    "agent_uuid": agent_uuid,
+                    "entity_uuid": agent_uuid,
+                    "amount": -recovery_amount,
+                    "transaction_id": self.next_tx("ADV"),
+                    "commission_statement_record_uuid": statement_uuid,
+                    "statement_uuid": statement_uuid,
+                    "policy_advance_uuid": policy_advance_uuid,
+                }
+            )
+            if record.get("policy_advance_recovered_amount") is not None:
+                curr_recovered = money(record.get("policy_advance_recovered_amount")) or Decimal("0.00")
+                record["policy_advance_recovered_amount"] = curr_recovered + recovery_amount
+
+        recovery_line = dict(line)
+        recovery_line["amount"] = recovery_amount
+        self.persist_entry(
+            record,
+            commission_uuid,
+            TYPE_ADVANCE_EARNED,
+            recovery_line,
         )
 
     def apply_commission(self, record, event_uuid, match, gross, commission_type):
@@ -2736,7 +2858,23 @@ class Forecast:
             header = per_member_amount(match, record["premium_amount"]) or gross
         commission_uuid = self.add_commission(record, event_uuid, commission_type, header)
         for line in allocated:
-            self.persist_entry(record, commission_uuid, commission_type, line)
+            agent_uuid = line.get("user_uuid")
+            policy_uuid = record.get("forecast_policy_uuid") or record.get("policy_uuid")
+            split_amount = money(line.get("amount")) or Decimal("0.00")
+            outstanding = Decimal("0.00")
+            if split_amount > Decimal("0.00") and agent_uuid and policy_uuid:
+                outstanding = self.get_agent_advance_outstanding(record["agency_id"], policy_uuid, agent_uuid)
+
+            if outstanding > Decimal("0.00"):
+                recovery_amount, commission_amount = self.calculate_agent_recovery_split(outstanding, split_amount)
+                if recovery_amount > Decimal("0.00"):
+                    self.persist_recovery_entry(record, commission_uuid, line, recovery_amount)
+                if commission_amount > Decimal("0.00"):
+                    comm_line = dict(line)
+                    comm_line["amount"] = commission_amount
+                    self.persist_entry(record, commission_uuid, commission_type, comm_line)
+            else:
+                self.persist_entry(record, commission_uuid, commission_type, line)
 
     def apply_chargeback(self, record, event_uuid, amount):
         entity_type = str(record.get("chargeback_entity_type") or "").strip().lower()
@@ -2796,7 +2934,7 @@ class Forecast:
                 "entity_type": entity,
                 "commission_type": commission_type,
                 "amount": amount,
-                "status": "paid" if zero or entity == ENTITY_AGENCY else "ready_for_payment",
+                "status": "paid" if zero or entity == ENTITY_AGENCY or commission_type == TYPE_ADVANCE_EARNED else "ready_for_payment",
                 "transaction_id": self.next_tx("TX"),
                 "deleted_at": None,
                 "updated_at": datetime.now(),
