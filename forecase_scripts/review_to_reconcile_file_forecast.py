@@ -734,7 +734,7 @@ WHERE csr.agency_id = %s AND csr.uuid = %s::uuid AND csr.file_uuid = %s::uuid
 """
 
 AGENT_RESOLVE_SQL = """
-SELECT agent_uuid::text AS agent_uuid, resolution_method
+SELECT agent_uuid::text AS agent_uuid, resolution_method, priority
 FROM (
     SELECT a.user_uuid AS agent_uuid, 'npn' AS resolution_method, 1 AS priority
     FROM agents a
@@ -749,8 +749,8 @@ FROM (
     FROM users u
     WHERE u.tenant_id = %s AND u.id > 0 AND u.code = %s
 ) combined
+WHERE agent_uuid IS NOT NULL
 ORDER BY priority
-LIMIT 1
 """
 
 AGENT_NAME_RESOLVE_SQL = """
@@ -764,6 +764,10 @@ WHERE c.agency_id = %s
       OR regexp_replace(lower(trim(c.last_name || ' ' || c.first_name)), '\\s+', ' ', 'g') = %s
   )
 """
+
+AGENT_MISMATCH_CODE = "AGENT_MISMATCH"
+AGENT_MISMATCH_ID_NAME_MESSAGE = "Agent ID and Agent Name belong to different agents"
+
 
 
 REPEATED_WHITESPACE = re.compile(r"\s+")
@@ -1669,6 +1673,68 @@ class Forecast:
             if policy.get(field):
                 record[field] = policy[field]
 
+    def resolve_agent_by_npn(self, agency_id, npn, carrier_uuid=None):
+        trimmed_npn = (npn or "").strip()
+        if not trimmed_npn or agency_id is None:
+            return None, "NotFound", []
+        rows = self.select(
+            AGENT_RESOLVE_SQL,
+            (
+                agency_id,
+                trimmed_npn,
+                agency_id,
+                trimmed_npn,
+                carrier_uuid or "00000000-0000-0000-0000-000000000000",
+                agency_id,
+                trimmed_npn,
+            ),
+        )
+        valid_rows = [r for r in rows if r.get("agent_uuid")]
+        distinct_uuids = list(dict.fromkeys(r["agent_uuid"] for r in valid_rows))
+        if not distinct_uuids:
+            return None, "NotFound", []
+        if len(distinct_uuids) > 1:
+            return None, "ConflictingMatches", valid_rows
+        return distinct_uuids[0], "Resolved", valid_rows
+
+    def resolve_agent_by_name(self, agency_id, agent_name):
+        norm_name = AgentNames.normalize(agent_name)
+        if not norm_name or agency_id is None:
+            return None, "NotFound", []
+        rows = self.select(AGENT_NAME_RESOLVE_SQL, (agency_id, norm_name, norm_name))
+        valid_rows = [r for r in rows if r.get("agent_uuid")]
+        distinct_uuids = list(dict.fromkeys(r["agent_uuid"] for r in valid_rows))
+        if not distinct_uuids:
+            return None, "NotFound", []
+        if len(distinct_uuids) > 1:
+            return None, "AmbiguousFullName", valid_rows
+        return distinct_uuids[0], "Resolved", valid_rows
+
+    def check_agent_mismatch(self, record):
+        agent_npn = (record.get("agent_npn") or "").strip()
+        if not agent_npn and isinstance(record.get("data"), dict):
+            agent_npn = str(record["data"].get("agent_npn") or "").strip()
+        raw_name = record.get("agent_name")
+        if raw_name is None and isinstance(record.get("data"), dict):
+            raw_name = record["data"].get("agent_name")
+        agent_name = (raw_name or "").strip()
+        if not agent_npn or not agent_name:
+            return False
+
+        agency_id = record.get("agency_id")
+        carrier_uuid = record.get("carrier_uuid") or record.get("policy_carrier_id")
+
+        npn_uuid, npn_status, _ = self.resolve_agent_by_npn(agency_id, agent_npn, carrier_uuid)
+        name_uuid, name_status, _ = self.resolve_agent_by_name(agency_id, agent_name)
+
+        if (
+            npn_status == "Resolved"
+            and name_status == "Resolved"
+            and str(npn_uuid).lower() != str(name_uuid).lower()
+        ):
+            return True
+        return False
+
     def create_local_policy(self, record):
         existing = self.find_local_policy(record)
         if existing:
@@ -1693,44 +1759,47 @@ class Forecast:
                 "New policy was not created (reason=agent): agent NPN and agent name are missing.",
             )
             return False
+
+        if self.check_agent_mismatch(record):
+            self.add_exception(
+                record,
+                AGENT_MISMATCH_CODE,
+                AGENT_MISMATCH_ID_NAME_MESSAGE,
+            )
+            return False
+
         agent_rows = []
         if agent_npn:
-            agent_rows = self.select(
-                AGENT_RESOLVE_SQL,
-                (
-                    record["agency_id"],
-                    agent_npn,
-                    record["agency_id"],
-                    agent_npn,
-                    carrier_uuid or "00000000-0000-0000-0000-000000000000",
-                    record["agency_id"],
-                    agent_npn,
-                ),
+            npn_uuid, npn_status, npn_rows = self.resolve_agent_by_npn(
+                record["agency_id"],
+                agent_npn,
+                carrier_uuid,
             )
+            if npn_status == "Resolved":
+                agent_rows = [npn_rows[0]]
+            elif npn_status == "ConflictingMatches":
+                self.add_exception(
+                    record,
+                    "POLICY_MISMATCH",
+                    f"New policy was not created (reason=agent): agent NPN '{agent_npn}' was not found.",
+                )
+                return False
+
         if not agent_rows and agent_name:
-            norm_name = AgentNames.normalize(agent_name)
-            name_rows = (
-                self.select(AGENT_NAME_RESOLVE_SQL, (record["agency_id"], norm_name, norm_name))
-                if norm_name
-                else []
+            name_uuid, name_status, name_rows = self.resolve_agent_by_name(
+                record["agency_id"],
+                agent_name,
             )
-            unique = []
-            seen = set()
-            for row in name_rows:
-                uuid = row.get("agent_uuid")
-                if not uuid or uuid in seen:
-                    continue
-                seen.add(uuid)
-                unique.append(row)
-            if len(unique) == 1:
-                agent_rows = unique
-            elif len(unique) > 1:
+            if name_status == "Resolved":
+                agent_rows = [name_rows[0]]
+            elif name_status == "AmbiguousFullName":
+                unique_count = len(set(r["agent_uuid"] for r in name_rows if r.get("agent_uuid")))
                 self.add_exception(
                     record,
                     "POLICY_MISMATCH",
                     (
                         f"New policy was not created (reason=agent): agent name '{agent_name}' "
-                        f"matched {len(unique)} users."
+                        f"matched {unique_count} users."
                     ),
                 )
                 return False
@@ -2115,6 +2184,9 @@ class Forecast:
         if int(status_id) != POLICY_ACTIVE:
             label = POLICY_STATUS_LABELS.get(int(status_id), str(status_id))
             self.add_exception(record, "POLICY_MISMATCH", f"Policy found but not active ({label})")
+            return
+        if self.check_agent_mismatch(record):
+            self.add_exception(record, AGENT_MISMATCH_CODE, AGENT_MISMATCH_ID_NAME_MESSAGE)
             return
         matched, remark = agent_matches(record)
         if not matched:
