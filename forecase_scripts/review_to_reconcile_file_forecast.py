@@ -33,6 +33,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from collections import defaultdict
@@ -758,9 +759,55 @@ FROM contacts c
 WHERE c.agency_id = %s
   AND c.id > 0
   AND c.entity = 'agent'
-  AND LOWER(regexp_replace(TRIM(CONCAT(c.first_name, ' ', c.last_name)), '\\s+', ' ', 'g'))
-    = LOWER(regexp_replace(TRIM(%s), '\\s+', ' ', 'g'))
+  AND (
+      regexp_replace(lower(trim(c.first_name || ' ' || c.last_name)), '\\s+', ' ', 'g') = %s
+      OR regexp_replace(lower(trim(c.last_name || ' ' || c.first_name)), '\\s+', ' ', 'g') = %s
+  )
 """
+
+
+REPEATED_WHITESPACE = re.compile(r"\s+")
+
+
+class AgentNames:
+    """Normalizes a statement agent name before a contact lookup.
+
+    Case and repeated spaces are ignored. A two-word name matches in either order.
+    A name with more than two words matches only as written.
+    """
+
+    @staticmethod
+    def normalize(name: str | None) -> str | None:
+        if name is None:
+            return None
+        text = REPEATED_WHITESPACE.sub(" ", str(name).strip().lower())
+        return text if text else None
+
+    @classmethod
+    def matches(cls, file_name: str | None, contact_full_name: str | None) -> bool:
+        file = cls.normalize(file_name)
+        if not file:
+            return False
+        contact = cls.normalize(contact_full_name)
+        if not contact:
+            return False
+        if file == contact:
+            return True
+        swapped = cls.swap_two_word_name(file)
+        if not swapped:
+            return False
+        return swapped == contact
+
+    @staticmethod
+    def swap_two_word_name(name: str) -> str | None:
+        parts = name.split(" ")
+        if len(parts) != 2:
+            return None
+        return f"{parts[1]} {parts[0]}"
+
+
+normalize_agent_name = AgentNames.normalize
+agent_name_matches = AgentNames.matches
 
 
 def money(value):
@@ -1365,7 +1412,7 @@ def agent_matches(record):
 
     def same_name(column):
         current = record.get(column)
-        return bool(name and current and name.lower() == str(current).strip().lower())
+        return AgentNames.matches(name, current)
 
     checks = [
         (npn and record.get("carrier_agent_appointment_number") == npn, "mapped with carrier_specific_id"),
@@ -1661,7 +1708,12 @@ class Forecast:
                 ),
             )
         if not agent_rows and agent_name:
-            name_rows = self.select(AGENT_NAME_RESOLVE_SQL, (record["agency_id"], agent_name))
+            norm_name = AgentNames.normalize(agent_name)
+            name_rows = (
+                self.select(AGENT_NAME_RESOLVE_SQL, (record["agency_id"], norm_name, norm_name))
+                if norm_name
+                else []
+            )
             unique = []
             seen = set()
             for row in name_rows:
