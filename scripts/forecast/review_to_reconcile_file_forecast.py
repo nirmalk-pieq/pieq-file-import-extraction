@@ -37,7 +37,7 @@ import re
 import sys
 import uuid
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from urllib import error, parse, request
@@ -68,7 +68,8 @@ TYPE_TRUE_UP = "TRUE_UP"
 TYPE_ARF = "ARF"
 TYPE_AGENCY_CREDIT = "AGENCY_CREDIT"
 TYPE_ADVANCE_EARNED = "ADVANCE_EARNED"
-DEBIT_TYPES = {"CHARGEBACK", "ADVANCE_RECOVERY", "AGENCY_DEBIT"}
+TYPE_MMP = "MMP"
+DEBIT_TYPES = {"CHARGEBACK", "ADVANCE_RECOVERY", "AGENCY_DEBIT", "MMP"}
 POLICY_STATUS_LABELS = {
     0: "Active",
     1: "Pending",
@@ -1248,6 +1249,26 @@ SELECT EXISTS (
       AND commission_statement_record_uuid = %s::uuid
       AND amount < 0
 ) AS exists
+"""
+
+AGENT_MMP_CONFIG_SQL = """
+SELECT
+    marketing_contribution,
+    earning_type,
+    marketing_contribution_amount,
+    marketing_contribution_percentage
+FROM agents
+WHERE agency_id = %s
+  AND user_uuid = %s::uuid
+"""
+
+MMP_DEDUCTIONS_SUM_SQL = """
+SELECT COALESCE(SUM(ABS(amount)), 0) AS total
+FROM commission_details
+WHERE agency_id = %s
+  AND entity_uuid = %s::uuid
+  AND commission_type = %s
+  AND transaction_date BETWEEN %s AND %s
 """
 
 
@@ -2839,6 +2860,147 @@ class Forecast:
             recovery_line,
         )
 
+    def fetch_agent_mmp_config(self, agency_id, agent_uuid):
+        if not agency_id or not agent_uuid:
+            return None
+        configs = getattr(self, "agent_mmp_configs", {})
+        if str(agent_uuid) in configs:
+            return configs[str(agent_uuid)]
+        if getattr(self, "conn", None):
+            try:
+                rows = self.select(AGENT_MMP_CONFIG_SQL, (agency_id, str(agent_uuid)))
+                if rows:
+                    return {
+                        "marketing_contribution": as_bool(rows[0].get("marketing_contribution")),
+                        "earning_type": rows[0].get("earning_type"),
+                        "marketing_contribution_amount": money(rows[0].get("marketing_contribution_amount")),
+                        "marketing_contribution_percentage": money(rows[0].get("marketing_contribution_percentage")),
+                    }
+            except Exception:
+                pass
+        return None
+
+    def sum_marketing_contribution_deductions(self, agency_id, agent_uuid, month_start, month_end):
+        if not agency_id or not agent_uuid:
+            return Decimal("0.00")
+        db_total = Decimal("0.00")
+        if getattr(self, "conn", None):
+            try:
+                rows = self.select(
+                    MMP_DEDUCTIONS_SUM_SQL,
+                    (agency_id, str(agent_uuid), TYPE_MMP, month_start, month_end),
+                )
+                if rows and rows[0].get("total") is not None:
+                    db_total = money(rows[0]["total"]) or Decimal("0.00")
+            except Exception:
+                pass
+
+        mem_total = Decimal("0.00")
+        for detail in getattr(self, "details", []):
+            if (
+                str(detail.get("agency_id")) == str(agency_id)
+                and str(detail.get("entity_uuid")) == str(agent_uuid)
+                and str(detail.get("commission_type")) == TYPE_MMP
+            ):
+                amt = money(detail.get("amount")) or Decimal("0.00")
+                mem_total += abs(amt)
+
+        return db_total + mem_total
+
+    def evaluate_marketing_contribution(
+        self,
+        entity_type,
+        commission_type,
+        commission_amount,
+        agent_info,
+        summed_deductions,
+    ):
+        entity = str(entity_type or "").strip().lower()
+        if entity not in {ENTITY_AGENT, ENTITY_SUBAGENT}:
+            return None
+
+        comm_type_upper = str(commission_type or "").strip().upper()
+        if comm_type_upper in {"CHARGEBACK", "ADVANCE_RECOVERY", "AGENCY_DEBIT", "AGENCY_CREDIT", "ADVANCE_EARNED"}:
+            return None
+
+        if not agent_info or not agent_info.get("marketing_contribution"):
+            return None
+
+        contribution_limit = agent_info.get("marketing_contribution_amount")
+        if contribution_limit is None or contribution_limit <= Decimal("0.00"):
+            return None
+
+        earning_type_str = agent_info.get("earning_type")
+        if not earning_type_str or not self._earning_type_includes(earning_type_str, comm_type_upper):
+            return None
+
+        percentage = self._resolve_mmp_percentage(agent_info.get("marketing_contribution_percentage"))
+        if percentage is None:
+            return None
+
+        amount = money(commission_amount) or Decimal("0.00")
+        mmp_eligible_amount = (amount * percentage / Decimal("100")).quantize(MONEY, rounding=ROUND_HALF_UP)
+        if mmp_eligible_amount <= Decimal("0.00"):
+            return None
+
+        monthly_remaining = (contribution_limit - summed_deductions).quantize(MONEY, rounding=ROUND_HALF_UP)
+        if monthly_remaining <= Decimal("0.00"):
+            return None
+
+        return min(mmp_eligible_amount, monthly_remaining)
+
+    def _earning_type_includes(self, earning_type, commission_type):
+        if not earning_type:
+            return False
+        normalized_target = commission_type.strip().upper()
+        tokens = [t.strip().upper().replace(" ", "_") for t in str(earning_type).split(",")]
+        return normalized_target in tokens
+
+    def _resolve_mmp_percentage(self, percentage):
+        if percentage is None:
+            return Decimal("100.00")
+        scaled = (money(percentage) or Decimal("0.00")).quantize(MONEY, rounding=ROUND_HALF_UP)
+        if scaled < Decimal("0.00") or scaled > Decimal("100.00"):
+            return None
+        return scaled
+
+    def apply_mmp_contribution(self, record, commission_uuid, line, commission_type):
+        agent_uuid = line.get("user_uuid")
+        if not agent_uuid:
+            return
+
+        agency_id = record["agency_id"]
+        agent_info = self.fetch_agent_mmp_config(agency_id, agent_uuid)
+        if not agent_info or not agent_info.get("marketing_contribution"):
+            return
+
+        now = getattr(self, "today", date.today())
+        month_start = now.replace(day=1)
+        next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+        month_end = next_month - timedelta(days=1)
+
+        summed_deductions = self.sum_marketing_contribution_deductions(
+            agency_id, agent_uuid, month_start, month_end
+        )
+
+        deduction_amount = self.evaluate_marketing_contribution(
+            entity_type=line.get("entity"),
+            commission_type=commission_type,
+            commission_amount=line.get("amount"),
+            agent_info=agent_info,
+            summed_deductions=summed_deductions,
+        )
+
+        if deduction_amount and deduction_amount > Decimal("0.00"):
+            mmp_line = dict(line)
+            mmp_line["amount"] = -deduction_amount
+            self.persist_entry(
+                record,
+                commission_uuid,
+                TYPE_MMP,
+                mmp_line,
+            )
+
     def apply_commission(self, record, event_uuid, match, gross, commission_type):
         lines = split_lines(match.get("commission_split"))
         if commission_type == TYPE_TRUE_UP:
@@ -2873,8 +3035,10 @@ class Forecast:
                     comm_line = dict(line)
                     comm_line["amount"] = commission_amount
                     self.persist_entry(record, commission_uuid, commission_type, comm_line)
+                    self.apply_mmp_contribution(record, commission_uuid, comm_line, commission_type)
             else:
                 self.persist_entry(record, commission_uuid, commission_type, line)
+                self.apply_mmp_contribution(record, commission_uuid, line, commission_type)
 
     def apply_chargeback(self, record, event_uuid, amount):
         entity_type = str(record.get("chargeback_entity_type") or "").strip().lower()
