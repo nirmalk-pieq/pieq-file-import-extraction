@@ -33,6 +33,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from collections import defaultdict
@@ -1359,6 +1360,278 @@ def match_amount(matches, target, premium, members):
     return 0, None
 
 
+def display_commission_type(value):
+    text = str(value or "Commission").strip() or "Commission"
+    if text.isupper():
+        return text.title()
+    return text
+
+
+def setup_month_label(slab):
+    start = slab.get("month_from")
+    end = slab.get("month_to")
+    if start is None:
+        return "unknown"
+    if end is None:
+        return f"{start}+"
+    return f"{start}-{end}"
+
+
+def setup_label(slab, carrier_name):
+    carrier = str(carrier_name or "").strip() or "carrier"
+    return f"{display_commission_type(slab.get('commission_type_text'))} > {carrier} > {setup_month_label(slab)}"
+
+
+def slabs_matching_payout(slabs, target, premium, members):
+    if target is None:
+        return []
+
+    def collect(tolerance):
+        found = []
+        for slab in slabs:
+            expected = expected_commission_amount(slab, premium, members)
+            if expected is None:
+                continue
+            if amounts_match(expected, target, slab.get("payout_method"), tolerance):
+                found.append(slab)
+        return found
+
+    exact = collect(False)
+    return exact or collect(True)
+
+
+def commission_setup_recommendation(title, amount, paid_by_apl, labels, types):
+    if amount is None:
+        return None
+    amount_text = format(amount, "f")
+    if paid_by_apl and labels:
+        type_text = " and ".join(types) or "Commission"
+        return (
+            f"{title} APL paid {amount_text} as {type_text}. "
+            f"Select {'; '.join(labels)} to match the APL payout."
+        )
+    if paid_by_apl:
+        return f"{title} APL paid {amount_text}. No setup matches that payout."
+    if labels:
+        return (
+            f"{title} Statement gross is {amount_text}. "
+            f"Select {'; '.join(labels)} to match the statement payout."
+        )
+    return f"{title} Statement gross is {amount_text}. No setup matches that payout."
+
+
+def chargeback_recommendation(group, chargeback_amount, agency_name):
+    """Name every payee in the gross group. Ask for the agency only when that line is the chargeback."""
+    parts = []
+    agency_line = False
+    for row in group.get("rows") or []:
+        line_gross = apl_line_gross(row)
+        payee = str(row.get("agent") or "").strip()
+        if not payee and line_gross in (None, 0):
+            continue
+        is_agency = bool(payee and agency_name and payee_names_match(payee, agency_name))
+        display = agency_name if is_agency else payee
+        parts.append((display, line_gross))
+        if (
+            is_agency
+            and chargeback_amount is not None
+            and line_gross is not None
+            and abs(line_gross - chargeback_amount) <= Decimal("0.01")
+        ):
+            agency_line = True
+    if not parts:
+        return None
+    gross = group.get("gross")
+    if len(parts) == 1:
+        name, amount = parts[0]
+        paid = amount if amount is not None else gross
+        body = f"APL paid {format(paid, 'f')} to {name}."
+    else:
+        split = " and ".join(
+            f"{name} {format(amount, 'f')}" for name, amount in parts if name and amount is not None
+        )
+        body = f"APL paid {format(gross, 'f')} split {split}."
+    sentence = f"This is a Chargeback Exception. {body}"
+    if agency_line:
+        sentence += " Select the agency on the chargeback to match the APL payout."
+    return sentence
+
+
+def payee_names_match(left, right):
+    return bool(left and right) and _payee_key(left) == _payee_key(right)
+
+
+def _payee_key(name):
+    text = re.sub(r"[,.]", "", str(name).replace("-", " "))
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    if "main line" in text or re.search(r"\bmlb\b", text):
+        return "mlb"
+    return text
+
+
+def clean_apl_policy_number(value):
+    if value is None:
+        return ""
+    text = str(value).strip().replace("'", "").replace('"', "").strip()
+    text = re.sub(r"(?i)[A-Z]?(?:[_ -][A-Z]*)?OVR$", "", text).strip()
+    text = re.sub(r"(?i)^OVR[_ -]?", "", text).strip()
+    if text.endswith(".0"):
+        text = text[:-2].strip()
+    stripped = text.lstrip("0")
+    return stripped or ("0" if text else "")
+
+
+def _policy_suffix(suffix):
+    if not suffix or len(suffix) > 4:
+        return False
+    if len(suffix) == 1:
+        return True
+    return suffix.isdigit()
+
+
+def apl_policies_match(left, right):
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    longer, shorter = (left, right) if len(left) >= len(right) else (right, left)
+    return longer.startswith(shorter) and _policy_suffix(longer[len(shorter) :])
+
+
+def _header_index(headers):
+    return {str(header).strip().lower(): index for index, header in enumerate(headers) if header and str(header).strip()}
+
+
+def _header_value(row, index, *names):
+    for name in names:
+        position = index.get(name)
+        if position is None or position >= len(row):
+            continue
+        return row[position]
+    return None
+
+
+def apl_row_amount(earned, credit):
+    """Earned Commission when it is non-zero, otherwise Earned Credit."""
+    if earned is not None and earned != 0:
+        return earned
+    if credit is not None and credit != 0:
+        return credit
+    return earned if earned is not None else credit
+
+
+def apl_transaction_text(value):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return ""
+    if text.endswith(".0"):
+        text = text[:-2].strip()
+    return text
+
+
+def apl_line_gross(row):
+    """Gross Commission on the line, or the earned/credit amount when that column is empty."""
+    gross = row.get("gross")
+    if gross is not None:
+        return gross
+    return row.get("amount")
+
+
+def apl_row_relevant(row):
+    for key in ("amount", "gross", "advanced"):
+        if row.get(key) not in (None, 0):
+            return True
+    return False
+
+
+def apl_gross_groups(rows):
+    """One payout per transaction. A missing transaction id stays its own row."""
+    buckets = {}
+    order = []
+    for index, row in enumerate(rows):
+        key = row.get("transaction_id") or f"row:{index}"
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(row)
+    groups = []
+    for key in order:
+        items = buckets[key]
+        grosses = [row.get("gross") for row in items if row.get("gross") is not None]
+        if grosses:
+            gross = sum(grosses, Decimal("0"))
+        else:
+            gross = sum((row.get("amount") or Decimal("0") for row in items), Decimal("0"))
+        advanced_values = [row.get("advanced") for row in items if row.get("advanced") is not None]
+        advanced = sum(advanced_values, Decimal("0")) if advanced_values else None
+        groups.append({"transaction_id": key, "rows": items, "gross": gross, "advanced": advanced})
+    return groups
+
+
+def _apl_rows_from_table(headers, body):
+    index = _header_index(headers)
+    rows = []
+    for raw in body:
+        values = list(raw)
+        policy = clean_apl_policy_number(
+            _header_value(values, index, "policy number", "policy no", "policy no.", "policynumber", "policy_number")
+        )
+        if not policy:
+            continue
+        agent = _header_value(values, index, "agent name", "writing agent name", "name")
+        amount = apl_row_amount(
+            money(_header_value(values, index, "earned commission")),
+            money(_header_value(values, index, "earned credit")),
+        )
+        rows.append(
+            {
+                "policy": policy,
+                "agent": "" if agent is None else str(agent).strip(),
+                "amount": amount,
+                "gross": money(_header_value(values, index, "gross commission")),
+                "advanced": money(_header_value(values, index, "advanced")),
+                "transaction_id": apl_transaction_text(
+                    _header_value(values, index, "transaction id", "transaction_id", "transactionid")
+                ),
+            }
+        )
+    return rows
+
+
+def read_apl_payout_rows(path):
+    file_path = Path(path)
+    suffix = file_path.suffix.lower()
+    if suffix in {".xlsx", ".xlsm"}:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(file_path, read_only=True, data_only=True)
+        try:
+            sheet = workbook.active
+            table = list(sheet.iter_rows(values_only=True))
+        finally:
+            workbook.close()
+        if not table:
+            return []
+        return _apl_rows_from_table(table[0], table[1:])
+    if suffix != ".csv":
+        raise ForecastError(f"Unsupported APL statement file {file_path.name}")
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            with file_path.open(newline="", encoding=encoding) as handle:
+                reader = csv.reader(handle)
+                table = list(reader)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        return []
+    if not table:
+        return []
+    return _apl_rows_from_table(table[0], table[1:])
+
+
 def agent_matches(record):
     npn = (record.get("agent_npn") or "").strip()
     name = (record.get("agent_name") or "").strip()
@@ -1467,6 +1740,11 @@ class Forecast:
         self.local_contacts = []
         self.local_commissions = []
         self.reattached_policies = set()
+        self._apl_rows_loaded = False
+        self._apl_rows = []
+        self._apl_configured = False
+        self._carrier_name = None
+        self._agency_name = None
         self.auth = auth if isinstance(auth, dict) else {"token": auth}
         self.api_base_url = (api_base_url or "").rstrip("/")
 
@@ -1489,8 +1767,9 @@ class Forecast:
         return f"{prefix}-F{self.tx:06d}"
 
     def add_exception(self, record, code, message):
+        suggestion = self.payout_recommendation(record, code) or ""
         record["forecast_status"] = STATUS_FAILED
-        record["forecast_error"] = {"code": code, "message": message}
+        record["forecast_error"] = {"code": code, "message": message, "suggestion": suggestion}
         self.exceptions.append(
             {
                 "record_uuid": record["uuid"],
@@ -1498,10 +1777,144 @@ class Forecast:
                 "row_order": record.get("row_order"),
                 "code": code,
                 "message": message,
+                "suggestion": suggestion,
                 "match_remarks": record.get("match_remarks"),
             }
         )
-        log_row(record, "result=exception code=%s message=%s", code, message)
+        if suggestion:
+            log_row(record, "result=exception code=%s message=%s suggestion=%s", code, message, suggestion)
+        else:
+            log_row(record, "result=exception code=%s message=%s", code, message)
+
+    def payout_recommendation(self, record, code):
+        if code in {"COMMISSION_MISMATCH", "ADVANCE"}:
+            return self.commission_or_advance_recommendation(record, code)
+        if str(code).startswith("CHARGEBACK"):
+            return self.chargeback_agency_recommendation(record)
+        return None
+
+    def commission_or_advance_recommendation(self, record, code):
+        title = "This is a Commission Mismatch." if code == "COMMISSION_MISMATCH" else "This is an Advance Exception."
+        amount, paid_by_apl = self.commission_payout_target(record, code)
+        matches = slabs_matching_payout(
+            self.recommendation_slabs(record),
+            amount,
+            record.get("premium_amount"),
+            record.get("total_members"),
+        )
+        carrier = self.carrier_name()
+        labels = []
+        types = []
+        for slab in matches:
+            label = setup_label(slab, carrier)
+            if label not in labels:
+                labels.append(label)
+            display = display_commission_type(slab.get("commission_type_text"))
+            if display not in types:
+                types.append(display)
+        return commission_setup_recommendation(title, amount, paid_by_apl, labels, types)
+
+    def chargeback_agency_recommendation(self, record):
+        if not self.apl_statement_configured():
+            return None
+        group = self.matching_apl_group(record)
+        if group is None:
+            return None
+        return chargeback_recommendation(group, self.chargeback_match_amount(record), self.agency_name())
+
+    def matching_apl_group(self, record):
+        """APL transaction whose Gross Commission sum equals the statement gross."""
+        gross = record.get("gross")
+        if gross is None:
+            return None
+        for group in apl_gross_groups(self.apl_policy_rows(record)):
+            group_gross = group.get("gross")
+            if group_gross is None:
+                continue
+            if abs(group_gross - gross) <= Decimal("0.01"):
+                return group
+        return None
+
+    def commission_payout_target(self, record, code=None):
+        gross = record.get("gross")
+        group = self.matching_apl_group(record)
+        if group is None:
+            return gross, False
+        if code == "ADVANCE":
+            advanced = group.get("advanced")
+            if advanced not in (None, 0):
+                return advanced, True
+        return group.get("gross"), True
+
+    def recommendation_slabs(self, record):
+        policy_uuid = record.get("forecast_policy_uuid") or record.get("policy_uuid")
+        if not policy_uuid:
+            return []
+        local = self.local_slabs(policy_uuid)
+        persisted = self.persisted_commissions(
+            ALL_SLABS_SQL,
+            (record["agency_id"], policy_uuid),
+            policy_uuid,
+        )
+        return list(local) + list(persisted)
+
+    def apl_statement_configured(self):
+        self.apl_payout_rows()
+        return self._apl_configured
+
+    def apl_payout_rows(self):
+        if self._apl_rows_loaded:
+            return self._apl_rows
+        self._apl_rows_loaded = True
+        self._apl_rows = []
+        self._apl_configured = False
+        name = (self.statement or {}).get("name")
+        path = resolve_apl_statement(name)
+        if path is None:
+            return self._apl_rows
+        self._apl_configured = True
+        try:
+            self._apl_rows = read_apl_payout_rows(path)
+        except Exception as exc:
+            logger.warning("APL payout lookup skipped: %s", exc)
+            self._apl_rows = []
+        return self._apl_rows
+
+    def apl_policy_rows(self, record):
+        target = clean_apl_policy_number(record.get("policy_number"))
+        if not target:
+            return []
+        return [
+            row
+            for row in self.apl_payout_rows()
+            if apl_policies_match(target, row.get("policy")) and apl_row_relevant(row)
+        ]
+
+    def carrier_name(self):
+        if self._carrier_name is not None:
+            return self._carrier_name
+        self._carrier_name = ""
+        carrier_uuid = (self.statement or {}).get("carrier_uuid")
+        if not carrier_uuid:
+            return self._carrier_name
+        rows = self.select("SELECT name FROM carriers WHERE uuid = %s::uuid", (carrier_uuid,))
+        if rows:
+            self._carrier_name = rows[0].get("name") or ""
+        return self._carrier_name
+
+    def agency_name(self):
+        if self._agency_name is not None:
+            return self._agency_name
+        self._agency_name = ""
+        agency_id = (self.statement or {}).get("agency_id")
+        if agency_id is None and self.records:
+            agency_id = self.records[0].get("agency_id")
+        if agency_id is None:
+            return self._agency_name
+        rows = self.select("SELECT name FROM agencies WHERE id = %s", (agency_id,))
+        if rows:
+            self._agency_name = rows[0].get("name") or ""
+        return self._agency_name
 
     def refresh_file_status(self):
         unresolved = [row for row in self.records if row.get("forecast_status") == STATUS_FAILED]
@@ -2870,6 +3283,7 @@ def write_exceptions(path, forecast):
                 f"- Row order: {item['row_order']}",
                 f"- Error code: {item['code']}",
                 f"- Message: {item['message']}",
+                f"- Suggestion: {item.get('suggestion') or ''}",
                 f"- Match remarks: {item['match_remarks']}",
                 "",
             ]
@@ -2967,7 +3381,7 @@ def _forecast_workbook_sheets(statement_uuid, forecast):
             create_policy.append([reason, count])
     else:
         create_policy.append(["No create-policy reason tags in exceptions", ""])
-    exception_rows = [["Row", "Policy number", "Exception code", "Reason", "Message"]]
+    exception_rows = [["Row", "Policy number", "Exception code", "Reason", "Message", "Suggestion"]]
     if forecast.exceptions:
         for item in sorted(forecast.exceptions, key=lambda row: (row.get("row_order") is None, row.get("row_order") or 0)):
             exception_rows.append(
@@ -2977,10 +3391,11 @@ def _forecast_workbook_sheets(statement_uuid, forecast):
                     item.get("code"),
                     _exception_reason(item.get("message")),
                     item.get("message"),
+                    item.get("suggestion") or "",
                 ]
             )
     else:
-        exception_rows.append(["", "", "", "", "No exceptions"])
+        exception_rows.append(["", "", "", "", "No exceptions", ""])
     local_policies = [["Policy UUID", "Product", "Effective date"]]
     if forecast.local_policies:
         for row in forecast.local_policies:
@@ -3028,10 +3443,13 @@ def write_forecast_xlsx(path, statement_uuid, forecast):
         sheet = workbook.active if index == 0 else workbook.create_sheet(title)
         if index == 0:
             sheet.title = title
+        header = rows[0] if rows else []
         for row_index, row in enumerate(rows, start=1):
             for col_index, value in enumerate(row, start=1):
                 cell = sheet.cell(row=row_index, column=col_index, value=_excel_cell(value))
-                cell.alignment = Alignment(vertical="center", wrap_text=col_index == len(row))
+                header_name = header[col_index - 1] if col_index <= len(header) else ""
+                wrap = col_index == len(row) or header_name in {"Message", "Suggestion"}
+                cell.alignment = Alignment(vertical="center", wrap_text=wrap)
                 cell.border = thin
                 if row_index == 1:
                     cell.font = header_font
@@ -3105,23 +3523,24 @@ def write_forecast_md(path, statement_uuid, forecast):
         [
             "## Exception rows",
             "",
-            "| Row | Policy | Code | Reason | Message |",
-            "| ---: | --- | --- | --- | --- |",
+            "| Row | Policy | Code | Reason | Message | Suggestion |",
+            "| ---: | --- | --- | --- | --- | --- |",
         ]
     )
     if forecast.exceptions:
         for item in sorted(forecast.exceptions, key=lambda row: (row.get("row_order") is None, row.get("row_order") or 0)):
             lines.append(
-                "| {row} | {policy} | {code} | {reason} | {message} |".format(
+                "| {row} | {policy} | {code} | {reason} | {message} | {suggestion} |".format(
                     row=_md_cell(item.get("row_order")),
                     policy=_md_cell(item.get("policy_number")),
                     code=_md_cell(item.get("code")),
                     reason=_md_cell(_exception_reason(item.get("message"))),
                     message=_md_cell(item.get("message")),
+                    suggestion=_md_cell(item.get("suggestion")),
                 )
             )
     else:
-        lines.append("| | | | | No exceptions |")
+        lines.append("| | | | | No exceptions | |")
     lines.append("")
 
     lines.extend(
