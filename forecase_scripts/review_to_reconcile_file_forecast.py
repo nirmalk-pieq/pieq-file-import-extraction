@@ -2494,7 +2494,7 @@ class Forecast:
         chargeback = record["chargeback_amount"]
         gross = record["gross"]
         is_chargeback = (chargeback is not None and chargeback != 0) or (gross is not None and gross < 0)
-        if not is_chargeback or as_bool(record.get("is_policy_cancellation_validated")) or not record.get("has_policy_advance"):
+        if not is_chargeback or as_bool(record.get("is_policy_cancellation_validated")) or not self.has_active_arf(record):
             return False
         return str(record.get("policy_advance_initiated_by") or "").strip().lower() == "agency"
 
