@@ -1143,6 +1143,28 @@ POLICY_MONTH_SQL = f"""
 SELECT {POLICY_MONTH_EXPR}::int AS policy_month
 """
 
+ADVANCE_ELIGIBILITY_SQL = """
+SELECT
+    EXISTS (
+        SELECT 1
+        FROM advance_setups adv
+        WHERE adv.agency_id = %s
+          AND adv.product_uuid = %s::uuid
+    ) AS has_advance_setup,
+    EXISTS (
+        SELECT 1
+        FROM agents a
+        WHERE a.agency_id = %s
+          AND a.user_uuid = %s::uuid
+          AND COALESCE(a.eligible_for_carrier_advance, false)
+    ) AS agent_eligible
+"""
+
+ADVANCE_EXCEPTION_CODE = "ADVANCE_EXCEPTION"
+ADVANCE_EXCEPTION_MESSAGE = (
+    "Advance setup exists for this product and the pay-to agent is eligible for carrier advance."
+)
+
 HISTORICAL_AUTO_RECONCILE_SQL = """
 SELECT csr.policy_commission_uuid::text AS policy_commission_uuid
 FROM commission_statement_records csr
@@ -2219,6 +2241,8 @@ class Forecast:
         if not record.get("policy_exists"):
             if not self.create_local_policy(record):
                 return
+            if not str(record.get("transaction_type") or "").strip():
+                record["transaction_type"] = "NB"
         status_id = record.get("policy_status_id")
         if status_id is None:
             self.add_exception(record, "POLICY_MISMATCH", "Policy found but not active (status_id=null, unknown)")
@@ -2599,7 +2623,28 @@ class Forecast:
         )
         return month_matches
 
+    def advance_exception_applies(self, record):
+        """NB rows with a product advance setup and an eligible pay-to agent stop before commission matching."""
+        if str(record.get("transaction_type") or "").strip().upper() != "NB":
+            return False
+        if record.get("has_policy_advance"):
+            return False
+        product_uuid = record.get("policy_product_uuid")
+        agent_uuid = record.get("pay_to_agent_user_id")
+        if not product_uuid or not agent_uuid:
+            return False
+        rows = self.select(
+            ADVANCE_ELIGIBILITY_SQL,
+            (record["agency_id"], product_uuid, record["agency_id"], agent_uuid),
+        )
+        if not rows:
+            return False
+        return bool(rows[0].get("has_advance_setup")) and bool(rows[0].get("agent_eligible"))
+
     def match_commission(self, record, target):
+        if self.advance_exception_applies(record):
+            self.add_exception(record, ADVANCE_EXCEPTION_CODE, ADVANCE_EXCEPTION_MESSAGE)
+            return
         paid = record.get("paid_to_date") or record.get("policy_effective_date")
         effective = record.get("policy_effective_date")
         if paid is None or effective is None or not record.get("forecast_policy_uuid"):
