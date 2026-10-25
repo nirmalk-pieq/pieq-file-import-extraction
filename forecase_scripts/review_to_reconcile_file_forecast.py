@@ -4037,6 +4037,7 @@ def run_apl_cross_validation(out, statement_name):
             str(validation_dir / "Validation_Output.csv"),
             str(validation_dir / "Validation_Output.xlsx"),
             mode=mode,
+            single_grouped_file=True,
         )
     except Exception as exc:
         logger.exception("APL cross-validation failed: %s", exc)
