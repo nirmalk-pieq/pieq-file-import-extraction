@@ -906,6 +906,14 @@ def db_target_label(url):
     return f"host={host} port={port} db={database} user={user}"
 
 
+DB_KEEPALIVES = {
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 5,
+}
+
+
 def connect_readonly(url, password):
     conninfo = normalize_db_url(url)
     label = db_target_label(url)
@@ -916,12 +924,12 @@ def connect_readonly(url, password):
         try:
             import psycopg
 
-            conn = psycopg.connect(conninfo, password=password, autocommit=True)
+            conn = psycopg.connect(conninfo, password=password, autocommit=True, **DB_KEEPALIVES)
             driver = "psycopg"
         except ImportError:
             import psycopg2
 
-            conn = psycopg2.connect(conninfo, password=password)
+            conn = psycopg2.connect(conninfo, password=password, **DB_KEEPALIVES)
             conn.set_session(readonly=True, autocommit=True)
             driver = "psycopg2"
     except ImportError as exc:
@@ -1557,7 +1565,7 @@ def prorata_needed(gross, match, premium):
 
 
 class Forecast:
-    def __init__(self, conn, statement_uuid, auth=None, api_base_url=None):
+    def __init__(self, conn, statement_uuid, auth=None, api_base_url=None, api_cache=None):
         self.conn = conn
         self.statement_uuid = statement_uuid
         self.exceptions = []
@@ -1584,17 +1592,24 @@ class Forecast:
         self.reattached_policies = set()
         self.auth = auth if isinstance(auth, dict) else {"token": auth}
         self.api_base_url = (api_base_url or "").rstrip("/")
+        self.api_cache = api_cache if api_cache is not None else {}
 
     def fetch_api(self, url, agency_id):
+        key = (str(agency_id), url)
+        if key in self.api_cache:
+            logger.info("GET %s (cached)", url)
+            return self.api_cache[key]
         try:
-            return api_get(url, agency_id, self.auth.get("token"))
+            payload = api_get(url, agency_id, self.auth.get("token"))
         except TokenRejected as rejected:
             logger.warning(
                 "API token rejected with status %s. Requesting a new token and retrying this call.",
                 rejected.status,
             )
             self.auth["token"] = obtain_token()
-            return api_get(url, agency_id, self.auth.get("token"))
+            payload = api_get(url, agency_id, self.auth.get("token"))
+        self.api_cache[key] = payload
+        return payload
 
     def select(self, sql, params):
         return fetch_all(self.conn, sql, params)
@@ -4039,12 +4054,32 @@ def resolve_apl_statement(statement_name):
     return None
 
 
+_APL_VALIDATOR = None
+_APL_FRAMES = {}
+
+
 def load_apl_validator():
+    global _APL_VALIDATOR
+    if _APL_VALIDATOR is not None:
+        return _APL_VALIDATOR
     script = Path(__file__).resolve().parents[1] / "scripts" / "apl_icm_cross_validation" / "validate_apl_icm.py"
     spec = importlib.util.spec_from_file_location("validate_apl_icm", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _APL_VALIDATOR = module
     return module
+
+
+def cached_apl_frame(validator, apl_file):
+    key = str(Path(apl_file).resolve())
+    frame = _APL_FRAMES.get(key)
+    if frame is not None:
+        logger.info("Reusing APL statement loaded earlier: %s (%s rows)", key, len(frame))
+        return frame
+    logger.info("Loading APL statement once: %s", key)
+    frame = validator.align_apl_columns(validator.load_file(key))
+    _APL_FRAMES[key] = frame
+    return frame
 
 
 def resolve_apl_validation_mode():
@@ -4090,6 +4125,7 @@ def run_apl_cross_validation(out, statement_name):
             str(validation_dir / "Validation_Output.xlsx"),
             mode=mode,
             single_grouped_file=True,
+            apl_df=cached_apl_frame(validator, apl_file),
         )
     except Exception as exc:
         logger.exception("APL cross-validation failed: %s", exc)
@@ -4111,19 +4147,97 @@ def resolve_statement_name(conn, statement_uuid, statement_name=None):
     return rows[0]["name"] if rows else None
 
 
-def run_statement(conn, statement_uuid, auth, api_base_url, statement_name=None):
+def run_statement(conn, statement_uuid, auth, api_base_url, statement_name=None, api_cache=None):
     name = resolve_statement_name(conn, statement_uuid, statement_name)
     out = forecast_output_dir(statement_uuid, name)
     log_path = out / "forecast.log"
     handler = attach_forecast_log(log_path)
     try:
-        forecast = Forecast(conn, statement_uuid, auth, api_base_url)
+        forecast = Forecast(conn, statement_uuid, auth, api_base_url, api_cache=api_cache)
         forecast.reconcile()
         forecast.process_commissions()
         forecast.load_reference()
         write_forecast_output(statement_uuid, forecast, out=out)
     finally:
         detach_forecast_log(handler)
+
+
+def connection_is_closed(conn):
+    if conn is None:
+        return True
+    try:
+        return bool(conn.closed)
+    except Exception:
+        return True
+
+
+def close_connection(conn):
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def is_connection_error(exc):
+    text = str(exc).lower()
+    markers = (
+        "the connection is closed",
+        "the connection is lost",
+        "server closed the connection",
+        "consuming input failed",
+        "ssl connection has been closed",
+        "could not receive data",
+        "connection not open",
+        "connection already closed",
+        "could not connect",
+        "connection refused",
+        "connection timed out",
+        "timeout expired",
+    )
+    if any(marker in text for marker in markers):
+        return True
+    return type(exc).__name__ in {"OperationalError", "InterfaceError"}
+
+
+def ensure_connection(conn, url, password):
+    if not connection_is_closed(conn):
+        return conn
+    close_connection(conn)
+    logger.warning("Database connection is closed. Reconnecting.")
+    return connect_readonly(url, password)
+
+
+def forecast_statement(conn, db_url, db_password, statement_uuid, auth, api_base, api_cache, statement_name=None):
+    """Run one statement. Returns (connection, failed). One retry after a dropped database session."""
+    for attempt in (1, 2):
+        try:
+            conn = ensure_connection(conn, db_url, db_password)
+            run_statement(
+                conn,
+                statement_uuid,
+                auth,
+                api_base,
+                statement_name=statement_name,
+                api_cache=api_cache,
+            )
+            return conn, False
+        except Exception as exc:
+            if attempt == 1 and is_connection_error(exc):
+                logger.warning(
+                    "Database connection failed for %s. Reconnecting and retrying this file once.",
+                    statement_uuid,
+                )
+                close_connection(conn)
+                conn = None
+                continue
+            if is_connection_error(exc):
+                close_connection(conn)
+                conn = None
+            logger.exception("Forecast failed for %s: %s", statement_uuid, exc)
+            return conn, True
+    return conn, True
 
 
 def parse_agency_id(argv):
@@ -4208,6 +4322,7 @@ def main():
         db_url, db_password = resolve_database()
         conn = connect_readonly(db_url, db_password)
         api_base = require_env("PIEQ_API_BASE_URL")
+        api_cache = {}
         try:
             if review_all:
                 files = fetch_all(conn, REVIEW_FILES_SQL, (REVIEW_STAGE, agency_id))
@@ -4228,11 +4343,18 @@ def main():
                         row["uuid"],
                         row.get("name"),
                     )
-                    try:
-                        run_statement(conn, row["uuid"], auth, api_base, statement_name=row.get("name"))
-                    except Exception as exc:
+                    conn, file_failed = forecast_statement(
+                        conn,
+                        db_url,
+                        db_password,
+                        row["uuid"],
+                        auth,
+                        api_base,
+                        api_cache,
+                        statement_name=row.get("name"),
+                    )
+                    if file_failed:
                         failed += 1
-                        logger.exception("Forecast failed for %s: %s", row["uuid"], exc)
                 logger.info("Review forecast finished: files=%s failed=%s", len(files), failed)
                 return 1 if failed else 0
             failed = 0
@@ -4243,15 +4365,21 @@ def main():
                     len(statement_uuids),
                     statement_uuid,
                 )
-                try:
-                    run_statement(conn, statement_uuid, auth, api_base)
-                except Exception as exc:
+                conn, file_failed = forecast_statement(
+                    conn,
+                    db_url,
+                    db_password,
+                    statement_uuid,
+                    auth,
+                    api_base,
+                    api_cache,
+                )
+                if file_failed:
                     failed += 1
-                    logger.exception("Forecast failed for %s: %s", statement_uuid, exc)
             logger.info("Forecast finished: files=%s failed=%s", len(statement_uuids), failed)
             return 1 if failed else 0
         finally:
-            conn.close()
+            close_connection(conn)
     except ForecastError as exc:
         logger.error("%s", exc)
         return 1
