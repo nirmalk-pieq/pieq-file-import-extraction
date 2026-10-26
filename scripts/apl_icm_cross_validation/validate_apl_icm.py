@@ -423,7 +423,7 @@ def compare_icm_to_apl(apl_path, icm_path, amount_tolerance=0.01):
     return icm_lines, apl_only
 
 
-def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_tolerance=0.01, mode="apl", single_grouped_file=False):
+def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_tolerance=0.01, mode="apl", single_grouped_file=False, apl_df=None):
     mode = normalize_mode(mode) or "apl"
     if mode not in VALID_MODES:
         raise ValueError(f"Unsupported validation mode '{mode}'. Expected one of: {', '.join(VALID_MODES)}")
@@ -434,8 +434,12 @@ def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_t
 
     print("Loading APL Statement...")
     try:
-        df_apl = align_apl_columns(load_file(apl_path))
-        print(f" -> Loaded {len(df_apl)} records from APL.")
+        if apl_df is not None:
+            df_apl = apl_df.copy()
+            print(f" -> Reused {len(df_apl)} cached APL records.")
+        else:
+            df_apl = align_apl_columns(load_file(apl_path))
+            print(f" -> Loaded {len(df_apl)} records from APL.")
     except Exception as e:
         print(f"Error loading APL file: {e}")
         return
