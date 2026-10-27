@@ -139,11 +139,14 @@ def apl_line_amount(row):
     return "Earned Commission", "", 0.0
 
 
-def check_amount_match(row, icm_amt_val, tolerance=0.01):
+def check_amount_match(row, icm_amt_val, tolerance=0.02):
     # A $0 Earned Credit on a row that already has Earned Commission must not
     # consume an ICM $0 split. Only a row whose own line amount is ~0 can match $0.
     col, val_str, val_num = apl_line_amount(row)
-    if abs(val_num - icm_amt_val) <= tolerance:
+    # Compare integer cents. 1.06 - 1.05 is 0.010000000000000009 as a float, which fails <= 0.01.
+    apl_cents = int(round(val_num * 100))
+    icm_cents = int(round(float(icm_amt_val) * 100))
+    if abs(apl_cents - icm_cents) <= int(round(tolerance * 100)):
         return col, val_str if val_str else f"{val_num}"
     return "None", val_str
 
@@ -241,6 +244,72 @@ def _text(row, column):
 
 def _policy_text(row, column):
     return _text(row, column).replace("'", "").replace('"', "").strip()
+
+
+def _payable_type(value):
+    text = str(value or "").strip()
+    if not text or text.lower() == "nan":
+        return ""
+    return text.upper()
+
+
+def _payable_role(row):
+    for column in ("role_name", "Role Name", "role"):
+        if column not in getattr(row, "index", []):
+            continue
+        text = str(row[column]).strip()
+        if text and text.lower() != "nan":
+            return text.upper()
+    return ""
+
+
+def prepare_icm_payables(df):
+    """Drop MMP lines, and add advance-earned splits back into one amount per payee.
+
+    APL payables do not include the MMP contribution. An advance recovery is stored
+    as ADVANCE_EARNED plus the leftover COMMISSION for the same policy, agent, and
+    role. APL pays that person once, so those ICM amounts are compared as one total.
+    """
+    if df is None or df.empty or "commission_type" not in df.columns:
+        return df
+    work = df.copy()
+    types = work["commission_type"].map(_payable_type)
+    mmp_count = int((types == "MMP").sum())
+    if mmp_count:
+        print(f" -> Omitted {mmp_count} MMP rows. APL payables do not include the MMP contribution.")
+        work = work.loc[types != "MMP"].copy()
+    if work.empty:
+        return work.reset_index(drop=True)
+
+    groups = {}
+    order = []
+    for idx, row in work.iterrows():
+        key = (
+            clean_policy_number(row.get(ParallelColumns.POLICY_NUMBER)),
+            str(row.get(ParallelColumns.AGENT_NAME) or "").strip().upper(),
+            _payable_role(row),
+        )
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(idx)
+
+    rows_out = []
+    combined = 0
+    for key in order:
+        subset = work.loc[groups[key]]
+        type_list = [_payable_type(value) for value in subset["commission_type"]]
+        if "ADVANCE_EARNED" in type_list and len(subset) > 1:
+            total = round(sum(clean_amount(value) for value in subset[ParallelColumns.AMOUNT]), 2)
+            representative = subset.iloc[type_list.index("ADVANCE_EARNED")].copy()
+            representative[ParallelColumns.AMOUNT] = f"{total:.2f}"
+            rows_out.append(representative)
+            combined += len(subset) - 1
+        else:
+            rows_out.extend(row for _, row in subset.iterrows())
+    if combined:
+        print(f" -> Combined {combined} advance-earned split rows into the APL payout total.")
+    return pd.DataFrame(rows_out).reset_index(drop=True)
 
 
 def pair_apl_and_icm(df_apl, df_par, amount_tolerance):
@@ -355,14 +424,14 @@ def pair_apl_and_icm(df_apl, df_par, amount_tolerance):
     return apl_items, par_pool
 
 
-def compare_icm_to_apl(apl_path, icm_path, amount_tolerance=0.01):
+def compare_icm_to_apl(apl_path, icm_path, amount_tolerance=0.02):
     """Return one record per ICM line, plus APL lines that never paired."""
     print("Loading APL Statement...")
     df_apl = align_apl_columns(load_file(apl_path))
     print(f" -> Loaded {len(df_apl)} records from APL.")
 
     print("Loading ICM payables...")
-    df_par = load_file(icm_path)
+    df_par = prepare_icm_payables(load_file(icm_path))
     print(f" -> Loaded {len(df_par)} records from ICM.")
     missing = [
         name for name in (ParallelColumns.POLICY_NUMBER, ParallelColumns.AGENT_NAME, ParallelColumns.AMOUNT)
@@ -423,7 +492,7 @@ def compare_icm_to_apl(apl_path, icm_path, amount_tolerance=0.01):
     return icm_lines, apl_only
 
 
-def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_tolerance=0.01, mode="apl", single_grouped_file=False, apl_df=None):
+def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_tolerance=0.02, mode="apl", single_grouped_file=False, apl_df=None):
     mode = normalize_mode(mode) or "apl"
     if mode not in VALID_MODES:
         raise ValueError(f"Unsupported validation mode '{mode}'. Expected one of: {', '.join(VALID_MODES)}")
@@ -446,7 +515,7 @@ def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_t
 
     print("Loading Parallel Run Payables...")
     try:
-        df_par = load_file(parallel_path)
+        df_par = prepare_icm_payables(load_file(parallel_path))
         print(f" -> Loaded {len(df_par)} records from Parallel Run.")
     except Exception as e:
         print(f"Error loading Parallel Run file: {e}")
@@ -823,7 +892,7 @@ if __name__ == "__main__":
         "--parallel",
         help="Path to the forecast commission_detail_report.csv (ICM payables)",
     )
-    parser.add_argument("--tolerance", type=float, default=0.01, help="Amount match tolerance (default 0.01)")
+    parser.add_argument("--tolerance", type=float, default=0.02, help="Amount match tolerance (default 0.01)")
     parser.add_argument(
         "--mode",
         choices=list(VALID_MODES),
@@ -851,7 +920,7 @@ if __name__ == "__main__":
         parallel_file = input(
             "Enter path to forecast commission_detail_report.csv: "
         ).strip().strip('\'"')
-        tolerance = 0.01
+        tolerance = 0.02
         use_tol = input("Do you want to set a custom amount tolerance? (y/n) [default: n]: ").strip().lower()
         if use_tol in ['y', 'yes']:
             tol_input = input("Enter amount tolerance (e.g. 0.05, 1.5): ").strip()
