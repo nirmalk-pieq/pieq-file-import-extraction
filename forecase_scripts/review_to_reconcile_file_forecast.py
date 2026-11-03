@@ -28,6 +28,7 @@ Environment:
 
 from __future__ import annotations
 
+import copy
 import csv
 import importlib.util
 import json
@@ -241,6 +242,11 @@ def policy_month_index(paid, effective):
     effective_day = calendar_day(effective)
     if paid_day is None or effective_day is None or paid_day < effective_day:
         return None
+    return (paid_day.year - effective_day.year) * 12 + (paid_day.month - effective_day.month)
+
+
+def sql_policy_month(paid_day, effective_day):
+    """Same integer as POLICY_MONTH_EXPR, including a negative month when paid-to is earlier."""
     return (paid_day.year - effective_day.year) * 12 + (paid_day.month - effective_day.month)
 
 
@@ -1301,6 +1307,257 @@ WHERE agency_id = %s
   AND transaction_date BETWEEN %s AND %s
 """
 
+PRELOAD_CHUNK = 2000
+
+PRELOAD_COMMISSIONS_SQL = """
+SELECT policy_uuid::text AS policy_uuid, uuid::text AS uuid, fee_amount, payout_method, premium_amount,
+       commission_type_text, commission_split, month_from, month_to, commission_type,
+       commission_setup_uuid::text AS commission_setup_uuid
+FROM policy_commission
+WHERE agency_id = %s AND policy_uuid::text = ANY(%s)
+"""
+
+PRELOAD_REATTACH_SQL = """
+SELECT
+    pol.uuid::text AS policy_uuid,
+    (
+        SELECT MAX(pc.month_to)
+        FROM policy_commission pc
+        WHERE pc.agency_id = pol.agency_id
+          AND pc.policy_uuid = pol.uuid
+          AND pc.month_from = 1
+          AND pc.commission_type = 1
+    ) AS max_month_to,
+    prod.uuid::text AS product_uuid,
+    pol.premium_amount AS policy_premium_amount,
+    prod.attach_latest_commissions AS attach_latest_commissions
+FROM policies pol
+LEFT JOIN products prod
+    ON prod.agency_id = pol.agency_id
+   AND prod.uuid = pol.product_id
+WHERE pol.agency_id = %s
+  AND pol.uuid::text = ANY(%s)
+"""
+
+PRELOAD_ADVANCE_SQL = """
+SELECT policy_uuid::text AS policy_uuid, agent_uuid::text AS agent_uuid,
+       COALESCE(SUM(amount), 0) AS total
+FROM agent_advance_ledgers
+WHERE agency_id = %s AND policy_uuid::text = ANY(%s)
+GROUP BY policy_uuid, agent_uuid
+"""
+
+PRELOAD_AGENTS_BY_NPN_SQL = """
+SELECT a.npn AS npn, a.user_uuid::text AS agent_uuid
+FROM agents a
+WHERE a.agency_id = %s AND a.id > 0 AND a.npn = ANY(%s) AND a.user_uuid IS NOT NULL
+"""
+
+PRELOAD_APPOINTMENTS_SQL = """
+SELECT ca.number AS number, ca.carrier_id::text AS carrier_id, ca.agent_id::text AS agent_uuid
+FROM carrier_appointments ca
+WHERE ca.agency_id = %s AND ca.id > 0 AND ca.number = ANY(%s) AND ca.agent_id IS NOT NULL
+"""
+
+PRELOAD_USER_CODES_SQL = """
+SELECT u.code AS code, u.uuid::text AS agent_uuid
+FROM users u
+WHERE u.tenant_id = %s AND u.id > 0 AND u.code = ANY(%s) AND u.uuid IS NOT NULL
+"""
+
+PRELOAD_AGENT_NAMES_SQL = """
+SELECT DISTINCT c.relationship_id::text AS agent_uuid,
+       regexp_replace(lower(trim(c.first_name || ' ' || c.last_name)), '\\s+', ' ', 'g') AS full_name,
+       regexp_replace(lower(trim(c.last_name || ' ' || c.first_name)), '\\s+', ' ', 'g') AS swapped_name
+FROM contacts c
+WHERE c.agency_id = %s
+  AND c.id > 0
+  AND c.entity = 'agent'
+  AND c.relationship_id IS NOT NULL
+  AND (
+      regexp_replace(lower(trim(c.first_name || ' ' || c.last_name)), '\\s+', ' ', 'g') = ANY(%s)
+      OR regexp_replace(lower(trim(c.last_name || ' ' || c.first_name)), '\\s+', ' ', 'g') = ANY(%s)
+  )
+"""
+
+PRELOAD_MMP_CONFIG_SQL = """
+SELECT user_uuid::text AS user_uuid, marketing_contribution, earning_type,
+       marketing_contribution_amount, marketing_contribution_percentage
+FROM agents
+WHERE agency_id = %s AND user_uuid::text = ANY(%s)
+"""
+
+PRELOAD_MMP_DEDUCTIONS_SQL = """
+SELECT entity_uuid::text AS entity_uuid, COALESCE(SUM(ABS(amount)), 0) AS total
+FROM commission_details
+WHERE agency_id = %s
+  AND entity_uuid::text = ANY(%s)
+  AND commission_type = %s
+  AND transaction_date BETWEEN %s AND %s
+GROUP BY entity_uuid
+"""
+
+MATCH_ROW_FIELDS = (
+    "uuid",
+    "fee_amount",
+    "payout_method",
+    "premium_amount",
+    "commission_type_text",
+    "commission_split",
+    "month_from",
+    "month_to",
+)
+ALL_SLAB_FIELDS = (
+    "month_from",
+    "month_to",
+    "fee_amount",
+    "payout_method",
+    "premium_amount",
+    "commission_type_text",
+)
+FMV_ROW_FIELDS = (
+    "uuid",
+    "month_from",
+    "month_to",
+    "fee_amount",
+    "payout_method",
+    "premium_amount",
+    "commission_type_text",
+    "commission_split",
+)
+REATTACH_ROW_FIELDS = (
+    "uuid",
+    "commission_type",
+    "commission_type_text",
+    "month_from",
+    "month_to",
+    "fee_amount",
+    "payout_method",
+    "premium_amount",
+    "commission_split",
+    "commission_setup_uuid",
+)
+SPLIT_ROW_FIELDS = (
+    "uuid",
+    "fee_amount",
+    "payout_method",
+    "commission_split",
+    "commission_type_text",
+)
+
+
+def freeze_params(value):
+    if isinstance(value, Decimal):
+        return ("Decimal", format(value, "f"))
+    if isinstance(value, datetime):
+        return ("datetime", value.isoformat())
+    if isinstance(value, date):
+        return ("date", value.isoformat())
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_params(item) for item in value)
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), freeze_params(item)) for key, item in value.items()))
+    return value
+
+
+def in_chunks(values, size=PRELOAD_CHUNK):
+    items = list(values)
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def project_row(row, fields):
+    return {field: row.get(field) for field in fields}
+
+
+def slab_covers_policy_month(row, policy_month):
+    """Same predicate as MATCH_SQL. A month_to of 0 is a real end, not an open slab."""
+    start = row.get("month_from")
+    if start is None or policy_month is None:
+        return False
+    if policy_month < int(start):
+        return False
+    end = row.get("month_to")
+    if end is None:
+        return True
+    return policy_month <= int(end)
+
+
+def all_slabs_sort_key(row):
+    month_to = row.get("month_to")
+    return (row.get("month_from"), month_to is None, 0 if month_to is None else month_to)
+
+
+def mmp_month_bounds(today):
+    month_start = today.replace(day=1)
+    next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return month_start, next_month - timedelta(days=1)
+
+
+def mmp_config_from_row(row):
+    return {
+        "marketing_contribution": as_bool(row.get("marketing_contribution")),
+        "earning_type": row.get("earning_type"),
+        "marketing_contribution_amount": money(row.get("marketing_contribution_amount")),
+        "marketing_contribution_percentage": money(row.get("marketing_contribution_percentage")),
+    }
+
+
+def canon_id(value):
+    if value is None:
+        return None
+    return str(value).lower()
+
+
+def remember_unique(bucket, key, agent_uuid):
+    if not key or not agent_uuid:
+        return
+    found = bucket.setdefault(key, [])
+    if agent_uuid not in found:
+        found.append(agent_uuid)
+
+
+def resolution_from_rows(rows, conflict_status):
+    valid_rows = [row for row in rows if row.get("agent_uuid")]
+    distinct_uuids = list(dict.fromkeys(row["agent_uuid"] for row in valid_rows))
+    if not distinct_uuids:
+        return None, "NotFound", []
+    if len(distinct_uuids) > 1:
+        return None, conflict_status, valid_rows
+    return distinct_uuids[0], "Resolved", valid_rows
+
+
+def statement_agent_values(record):
+    npn = (record.get("agent_npn") or "").strip()
+    name = (record.get("agent_name") or "").strip()
+    data = record.get("data")
+    if not isinstance(data, dict) and isinstance(data, str):
+        try:
+            parsed = json_obj(data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        data = parsed if isinstance(parsed, dict) else None
+    if isinstance(data, dict):
+        if not npn:
+            npn = str(data.get("agent_npn") or "").strip()
+        if not name:
+            name = str(data.get("agent_name") or "").strip()
+    return npn, name
+
+
+def iter_split_user_ids(value):
+    try:
+        payload = json_obj(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, list):
+        return
+    for item in payload:
+        if isinstance(item, dict) and item.get("user_uuid"):
+            yield canon_id(item.get("user_uuid"))
+
 
 def per_member_amount(match, premium):
     fee = money(match.get("fee_amount"))
@@ -1593,6 +1850,22 @@ class Forecast:
         self.auth = auth if isinstance(auth, dict) else {"token": auth}
         self.api_base_url = (api_base_url or "").rstrip("/")
         self.api_cache = api_cache if api_cache is not None else {}
+        self.query_cache = {}
+        self.preloaded_agency_id = None
+        self.preloaded_policy_ids = set()
+        self.commissions_by_policy = {}
+        self.commission_by_uuid = {}
+        self.reattach_by_policy = {}
+        self.advance_totals = {}
+        self.mmp_config_by_agent = {}
+        self.mmp_db_totals = {}
+        self.mmp_bounds = None
+        self.npn_to_agents = {}
+        self.appointment_to_agents = {}
+        self.code_to_agents = {}
+        self.name_to_agents = {}
+        self.preloaded_npns = set()
+        self.preloaded_names = set()
 
     def fetch_api(self, url, agency_id):
         key = (str(agency_id), url)
@@ -1612,7 +1885,10 @@ class Forecast:
         return payload
 
     def select(self, sql, params):
-        return fetch_all(self.conn, sql, params)
+        key = (sql, freeze_params(params))
+        if key not in self.query_cache:
+            self.query_cache[key] = fetch_all(self.conn, sql, params)
+        return [copy.deepcopy(row) for row in self.query_cache[key]]
 
     def next_tx(self, prefix):
         self.tx += 1
@@ -1653,6 +1929,7 @@ class Forecast:
             "updated_at": first.get("statement_updated_at"),
             "carrier_uuid": first.get("carrier_uuid"),
         }
+        self.preload_reference(rows)
         for record in rows:
             record["paid_to_date"] = statement_paid_to_date(record)
             record["gross"] = money(record.get("gross_commission"))
@@ -1700,6 +1977,113 @@ class Forecast:
             self.statement["forecast_status"],
         )
 
+    def preload_reference(self, rows):
+        """Load the statement's policies, slabs, agents, and balances in a few queries.
+
+        Later row matching reads this snapshot. The database connection is read only,
+        so the snapshot matches the per-row SELECTs it replaces.
+        """
+        agency_id = self.statement.get("agency_id")
+        if agency_id is None:
+            return
+        self.preloaded_agency_id = agency_id
+        policy_ids = []
+        seen_policies = set()
+        npns = []
+        seen_npns = set()
+        names = []
+        seen_names = set()
+        user_ids = []
+        seen_users = set()
+
+        def add_user(value):
+            text = canon_id(value)
+            if not text or text in seen_users:
+                return
+            seen_users.add(text)
+            user_ids.append(text)
+
+        for record in rows:
+            for key in ("policy_uuid", "stored_policy_uuid"):
+                policy_uuid = canon_id(record.get(key))
+                if policy_uuid and policy_uuid not in seen_policies:
+                    seen_policies.add(policy_uuid)
+                    policy_ids.append(policy_uuid)
+            npn, name = statement_agent_values(record)
+            if npn and npn not in seen_npns:
+                seen_npns.add(npn)
+                npns.append(npn)
+            norm_name = AgentNames.normalize(name)
+            if norm_name and norm_name not in seen_names:
+                seen_names.add(norm_name)
+                names.append(norm_name)
+            add_user(record.get("pay_to_agent_user_id"))
+            add_user(record.get("policy_advance_entity_uuid"))
+
+        self.preloaded_policy_ids = set(policy_ids)
+        for chunk in in_chunks(policy_ids):
+            for row in fetch_all(self.conn, PRELOAD_COMMISSIONS_SQL, (agency_id, chunk)):
+                policy_uuid = canon_id(row.get("policy_uuid"))
+                self.commissions_by_policy.setdefault(policy_uuid, []).append(row)
+                commission_uuid = canon_id(row.get("uuid"))
+                if commission_uuid:
+                    self.commission_by_uuid[commission_uuid] = row
+                for user_uuid in iter_split_user_ids(row.get("commission_split")):
+                    add_user(user_uuid)
+            for row in fetch_all(self.conn, PRELOAD_REATTACH_SQL, (agency_id, chunk)):
+                self.reattach_by_policy[canon_id(row.get("policy_uuid"))] = row
+            for row in fetch_all(self.conn, PRELOAD_ADVANCE_SQL, (agency_id, chunk)):
+                total = money(row.get("total")) or Decimal("0.00")
+                self.advance_totals[(canon_id(row.get("policy_uuid")), canon_id(row.get("agent_uuid")))] = total
+
+        self.preloaded_npns = set(npns)
+        for chunk in in_chunks(npns):
+            for row in fetch_all(self.conn, PRELOAD_AGENTS_BY_NPN_SQL, (agency_id, chunk)):
+                remember_unique(self.npn_to_agents, row.get("npn"), row.get("agent_uuid"))
+            for row in fetch_all(self.conn, PRELOAD_APPOINTMENTS_SQL, (agency_id, chunk)):
+                remember_unique(
+                    self.appointment_to_agents,
+                    (row.get("number"), canon_id(row.get("carrier_id")) or ""),
+                    row.get("agent_uuid"),
+                )
+            for row in fetch_all(self.conn, PRELOAD_USER_CODES_SQL, (agency_id, chunk)):
+                remember_unique(self.code_to_agents, row.get("code"), row.get("agent_uuid"))
+
+        self.preloaded_names = set(names)
+        for chunk in in_chunks(names):
+            for row in fetch_all(self.conn, PRELOAD_AGENT_NAMES_SQL, (agency_id, chunk, chunk)):
+                for key in (row.get("full_name"), row.get("swapped_name")):
+                    if key in self.preloaded_names:
+                        remember_unique(self.name_to_agents, key, row.get("agent_uuid"))
+
+        month_start, month_end = mmp_month_bounds(self.today)
+        self.mmp_bounds = (month_start, month_end)
+        for user_uuid in user_ids:
+            self.mmp_config_by_agent[user_uuid] = None
+            self.mmp_db_totals[user_uuid] = Decimal("0.00")
+        for chunk in in_chunks(user_ids):
+            for row in fetch_all(self.conn, PRELOAD_MMP_CONFIG_SQL, (agency_id, chunk)):
+                user_uuid = canon_id(row.get("user_uuid"))
+                if user_uuid and self.mmp_config_by_agent.get(user_uuid) is None:
+                    self.mmp_config_by_agent[user_uuid] = mmp_config_from_row(row)
+            for row in fetch_all(
+                self.conn,
+                PRELOAD_MMP_DEDUCTIONS_SQL,
+                (agency_id, chunk, TYPE_MMP, month_start, month_end),
+            ):
+                user_uuid = canon_id(row.get("entity_uuid"))
+                if user_uuid:
+                    self.mmp_db_totals[user_uuid] = money(row.get("total")) or Decimal("0.00")
+
+        logger.info(
+            "Preloaded reference data: policies=%s commission_rows=%s npns=%s names=%s agents=%s",
+            len(self.preloaded_policy_ids),
+            sum(len(items) for items in self.commissions_by_policy.values()),
+            len(self.preloaded_npns),
+            len(self.preloaded_names),
+            len(user_ids),
+        )
+
     def local_month_matches(self, policy_uuid, policy_month):
         if policy_month is None:
             return []
@@ -1719,7 +2103,41 @@ class Forecast:
     def persisted_commissions(self, sql, params, policy_uuid):
         if policy_uuid and policy_uuid in self.reattached_policies:
             return []
+        policy_key = canon_id(policy_uuid)
+        if (
+            policy_key in self.preloaded_policy_ids
+            and params
+            and params[0] == self.preloaded_agency_id
+        ):
+            loaded = self.commissions_from_preload(sql, params, policy_key)
+            if loaded is not None:
+                return loaded
         return self.select(sql, params)
+
+    def commissions_from_preload(self, sql, params, policy_uuid):
+        rows = self.commissions_by_policy.get(policy_uuid, [])
+        if sql == MATCH_SQL:
+            policy_month = sql_policy_month(params[2], params[3])
+            covered = [row for row in rows if slab_covers_policy_month(row, policy_month)]
+            covered.sort(key=lambda row: (*all_slabs_sort_key(row), str(row.get("uuid") or "")))
+            return [copy.deepcopy(project_row(row, MATCH_ROW_FIELDS)) for row in covered]
+        if sql == ALL_SLABS_SQL:
+            covered = [row for row in rows if row.get("month_from") is not None]
+            covered.sort(key=all_slabs_sort_key)
+            return [copy.deepcopy(project_row(row, ALL_SLAB_FIELDS)) for row in covered]
+        if sql == FMV_SLABS_SQL:
+            return [
+                copy.deepcopy(project_row(row, FMV_ROW_FIELDS))
+                for row in rows
+                if row.get("month_from") is not None
+            ]
+        return None
+
+    def split_row(self, agency_id, commission_uuid):
+        stored = self.commission_by_uuid.get(canon_id(commission_uuid) or "")
+        if stored is not None and agency_id == self.preloaded_agency_id:
+            return [copy.deepcopy(project_row(stored, SPLIT_ROW_FIELDS))]
+        return self.select(SPLIT_BY_UUID_SQL, (agency_id, commission_uuid))
 
     def find_local_policy(self, record):
         number = str(record.get("policy_number") or "").strip()
@@ -1756,6 +2174,18 @@ class Forecast:
         trimmed_npn = (npn or "").strip()
         if not trimmed_npn or agency_id is None:
             return None, "NotFound", []
+        if agency_id == self.preloaded_agency_id and trimmed_npn in self.preloaded_npns:
+            carrier = canon_id(carrier_uuid) or "00000000-0000-0000-0000-000000000000"
+            rows = [{"agent_uuid": agent_uuid, "resolution_method": "npn", "priority": 1} for agent_uuid in self.npn_to_agents.get(trimmed_npn, [])]
+            rows.extend(
+                {"agent_uuid": agent_uuid, "resolution_method": "carrier_appointment", "priority": 2}
+                for agent_uuid in self.appointment_to_agents.get((trimmed_npn, carrier), [])
+            )
+            rows.extend(
+                {"agent_uuid": agent_uuid, "resolution_method": "user_code", "priority": 3}
+                for agent_uuid in self.code_to_agents.get(trimmed_npn, [])
+            )
+            return resolution_from_rows(rows, "ConflictingMatches")
         rows = self.select(
             AGENT_RESOLVE_SQL,
             (
@@ -1768,26 +2198,20 @@ class Forecast:
                 trimmed_npn,
             ),
         )
-        valid_rows = [r for r in rows if r.get("agent_uuid")]
-        distinct_uuids = list(dict.fromkeys(r["agent_uuid"] for r in valid_rows))
-        if not distinct_uuids:
-            return None, "NotFound", []
-        if len(distinct_uuids) > 1:
-            return None, "ConflictingMatches", valid_rows
-        return distinct_uuids[0], "Resolved", valid_rows
+        return resolution_from_rows(rows, "ConflictingMatches")
 
     def resolve_agent_by_name(self, agency_id, agent_name):
         norm_name = AgentNames.normalize(agent_name)
         if not norm_name or agency_id is None:
             return None, "NotFound", []
+        if agency_id == self.preloaded_agency_id and norm_name in self.preloaded_names:
+            rows = [
+                {"agent_uuid": agent_uuid, "resolution_method": "full_name"}
+                for agent_uuid in self.name_to_agents.get(norm_name, [])
+            ]
+            return resolution_from_rows(rows, "AmbiguousFullName")
         rows = self.select(AGENT_NAME_RESOLVE_SQL, (agency_id, norm_name, norm_name))
-        valid_rows = [r for r in rows if r.get("agent_uuid")]
-        distinct_uuids = list(dict.fromkeys(r["agent_uuid"] for r in valid_rows))
-        if not distinct_uuids:
-            return None, "NotFound", []
-        if len(distinct_uuids) > 1:
-            return None, "AmbiguousFullName", valid_rows
-        return distinct_uuids[0], "Resolved", valid_rows
+        return resolution_from_rows(rows, "AmbiguousFullName")
 
     def check_agent_mismatch(self, record):
         agent_npn = (record.get("agent_npn") or "").strip()
@@ -2105,9 +2529,13 @@ class Forecast:
         policy_uuid = record.get("forecast_policy_uuid")
         local_ids = {policy.get("uuid") for policy in self.local_policies}
         if policy_uuid not in local_ids:
-            rows = self.select(REATTACH_CONTEXT_SQL, (record["agency_id"], policy_uuid))
-            if rows:
-                return rows[0]
+            policy_key = canon_id(policy_uuid)
+            if policy_key in self.reattach_by_policy and record.get("agency_id") == self.preloaded_agency_id:
+                return copy.deepcopy(self.reattach_by_policy[policy_key])
+            if policy_key not in self.preloaded_policy_ids or record.get("agency_id") != self.preloaded_agency_id:
+                rows = self.select(REATTACH_CONTEXT_SQL, (record["agency_id"], policy_uuid))
+                if rows:
+                    return rows[0]
         product_uuid = record.get("policy_product_uuid")
         if not product_uuid:
             return None
@@ -2137,7 +2565,14 @@ class Forecast:
         local = self.local_slabs(policy_uuid)
         if local or policy_uuid in self.reattached_policies:
             return local
-        rows = self.select(REATTACH_ROWS_SQL, (record["agency_id"], policy_uuid))
+        policy_key = canon_id(policy_uuid)
+        if policy_key in self.preloaded_policy_ids and record.get("agency_id") == self.preloaded_agency_id:
+            rows = [
+                copy.deepcopy(project_row(row, REATTACH_ROW_FIELDS))
+                for row in self.commissions_by_policy.get(policy_key, [])
+            ]
+        else:
+            rows = self.select(REATTACH_ROWS_SQL, (record["agency_id"], policy_uuid))
         for row in rows:
             row["commission_split"] = json_obj(row.get("commission_split")) or []
             row["month_to"] = open_month_to(row.get("month_to"))
@@ -2386,8 +2821,7 @@ class Forecast:
             ),
             record.get("forecast_policy_uuid"),
         )
-        month_row = self.select(POLICY_MONTH_SQL, (paid_day, effective_day, paid_day, effective_day))
-        policy_month = month_row[0]["policy_month"] if month_row else None
+        policy_month = sql_policy_month(paid_day, effective_day)
         return self.local_month_matches(record.get("forecast_policy_uuid"), policy_month) + matches
 
     def try_chargeback_auto_resolve(self, record):
@@ -2596,8 +3030,7 @@ class Forecast:
             return
         paid_day = paid.date() if isinstance(paid, datetime) else paid
         effective_day = effective.date() if isinstance(effective, datetime) else effective
-        month_row = self.select(POLICY_MONTH_SQL, (paid_day, effective_day, paid_day, effective_day))
-        policy_month = month_row[0]["policy_month"] if month_row else None
+        policy_month = sql_policy_month(paid_day, effective_day)
         month_matches = self.persisted_commissions(
             MATCH_SQL,
             (
@@ -2686,8 +3119,7 @@ class Forecast:
             ),
             record.get("forecast_policy_uuid"),
         )
-        month_row = self.select(POLICY_MONTH_SQL, (paid_day, effective_day, paid_day, effective_day))
-        policy_month = month_row[0]["policy_month"] if month_row else None
+        policy_month = sql_policy_month(paid_day, effective_day)
         matches = self.local_month_matches(record.get("forecast_policy_uuid"), policy_month) + matches
         count, chosen = match_amount(matches, target, record["premium_amount"], record.get("total_members"))
         if count == 0:
@@ -2763,7 +3195,7 @@ class Forecast:
                 return
             match = record.get("matched_commission")
             if match is None and record.get("forecast_policy_commission_uuid"):
-                found = self.select(SPLIT_BY_UUID_SQL, (record["agency_id"], record["forecast_policy_commission_uuid"]))
+                found = self.split_row(record["agency_id"], record["forecast_policy_commission_uuid"])
                 match = found[0] if found else None
             if commission_validated and gross is not None and gross > 0 and match is not None:
                 self.apply_commission(record, event_uuid, match, gross, TYPE_COMMISSION)
@@ -2825,11 +3257,15 @@ class Forecast:
             return Decimal("0.00")
 
         db_total = Decimal("0.00")
-        if getattr(self, "conn", None):
+        policy_key = canon_id(policy_uuid)
+        agent_key = canon_id(agent_uuid)
+        if agency_id == self.preloaded_agency_id and policy_key in self.preloaded_policy_ids:
+            db_total = self.advance_totals.get((policy_key, agent_key), Decimal("0.00"))
+        elif getattr(self, "conn", None):
             try:
                 rows = self.select(
                     AGENT_ADVANCE_BALANCE_SQL,
-                    (agency_id, str(policy_uuid), str(agent_uuid)),
+                    (agency_id, policy_key, agent_key),
                 )
                 if rows and rows[0].get("total") is not None:
                     db_total = money(rows[0]["total"]) or Decimal("0.00")
@@ -2923,19 +3359,16 @@ class Forecast:
     def fetch_agent_mmp_config(self, agency_id, agent_uuid):
         if not agency_id or not agent_uuid:
             return None
-        configs = getattr(self, "agent_mmp_configs", {})
-        if str(agent_uuid) in configs:
-            return configs[str(agent_uuid)]
+        key = canon_id(agent_uuid)
+        if agency_id == self.preloaded_agency_id and key in self.mmp_config_by_agent:
+            return self.mmp_config_by_agent[key]
         if getattr(self, "conn", None):
             try:
-                rows = self.select(AGENT_MMP_CONFIG_SQL, (agency_id, str(agent_uuid)))
-                if rows:
-                    return {
-                        "marketing_contribution": as_bool(rows[0].get("marketing_contribution")),
-                        "earning_type": rows[0].get("earning_type"),
-                        "marketing_contribution_amount": money(rows[0].get("marketing_contribution_amount")),
-                        "marketing_contribution_percentage": money(rows[0].get("marketing_contribution_percentage")),
-                    }
+                rows = self.select(AGENT_MMP_CONFIG_SQL, (agency_id, key))
+                config = mmp_config_from_row(rows[0]) if rows else None
+                if agency_id == self.preloaded_agency_id:
+                    self.mmp_config_by_agent[key] = config
+                return config
             except Exception:
                 pass
         return None
@@ -2943,15 +3376,25 @@ class Forecast:
     def sum_marketing_contribution_deductions(self, agency_id, agent_uuid, month_start, month_end):
         if not agency_id or not agent_uuid:
             return Decimal("0.00")
+        key = canon_id(agent_uuid)
         db_total = Decimal("0.00")
-        if getattr(self, "conn", None):
+        use_preload = (
+            agency_id == self.preloaded_agency_id
+            and self.mmp_bounds == (month_start, month_end)
+            and key in self.mmp_db_totals
+        )
+        if use_preload:
+            db_total = self.mmp_db_totals[key]
+        elif getattr(self, "conn", None):
             try:
                 rows = self.select(
                     MMP_DEDUCTIONS_SUM_SQL,
-                    (agency_id, str(agent_uuid), TYPE_MMP, month_start, month_end),
+                    (agency_id, key, TYPE_MMP, month_start, month_end),
                 )
                 if rows and rows[0].get("total") is not None:
                     db_total = money(rows[0]["total"]) or Decimal("0.00")
+                if agency_id == self.preloaded_agency_id and self.mmp_bounds == (month_start, month_end):
+                    self.mmp_db_totals[key] = db_total
             except Exception:
                 pass
 
@@ -3104,7 +3547,7 @@ class Forecast:
         entity_type = str(record.get("chargeback_entity_type") or "").strip().lower()
         negative = amount.copy_abs() * Decimal("-1")
         if entity_type == "split" and record.get("chargeback_uuid"):
-            found = self.select(SPLIT_BY_UUID_SQL, (record["agency_id"], record["chargeback_uuid"]))
+            found = self.split_row(record["agency_id"], record["chargeback_uuid"])
             if not found:
                 return
             lines = split_lines(found[0].get("commission_split"))
