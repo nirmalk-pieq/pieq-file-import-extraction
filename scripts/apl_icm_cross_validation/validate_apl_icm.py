@@ -94,9 +94,13 @@ def clean_policy_number(val):
     v_str = str(val).strip()
     # Drop quote marks anywhere (APL values often look like '00000825606A8).
     v_str = v_str.replace("'", "").replace('"', "").strip()
-    # Override trailer: OVR, -OVR, _OVR, KOVR, K_BOVR, and the same shapes with a leading letter.
-    v_str = re.sub(r'(?i)[A-Z]?(?:[_ -][A-Z]*)?OVR$', '', v_str).strip()
+    # Separator trailer: _OVR, -OVR, K_BOVR. The letter before the separator belongs to the trailer.
+    v_str = re.sub(r'(?i)[A-Z]?[_ -][A-Z]*OVR$', '', v_str).strip()
+    # Glued trailer: 00010839708KOVR is policy 00010839708K. Keep that letter.
+    v_str = re.sub(r'(?i)OVR$', '', v_str).strip()
     v_str = re.sub(r'(?i)^OVR[_ -]?', '', v_str).strip()
+    # ICM chargeback policies append CB (102294480400CB). APL stores the base number.
+    v_str = re.sub(r'(?i)[_ -]?CB$', '', v_str).strip()
     if v_str.endswith(".0"):
         v_str = v_str[:-2].strip()
     # ICM often pads with a leading zero (055733973) while APL stores 55733973.
@@ -109,6 +113,11 @@ def clean_amount(val):
     try:
         cleaned = str(val).replace(',', '').replace('$', '').strip()
         if not cleaned:
+            return 0.0
+        # Accounting negatives: ($3.01) or (3.01)
+        if cleaned.startswith('(') and cleaned.endswith(')'):
+            cleaned = '-' + cleaned[1:-1].strip()
+        if not cleaned or cleaned == '-':
             return 0.0
         return float(cleaned)
     except ValueError:
@@ -139,14 +148,25 @@ def apl_line_amount(row):
     return "Earned Commission", "", 0.0
 
 
-def check_amount_match(row, icm_amt_val, tolerance=0.02):
+def amounts_same_sign(apl_amt, icm_amt):
+    """True when both are zero or both share the same sign."""
+    if apl_amt == 0 or icm_amt == 0:
+        return True
+    return (apl_amt > 0) == (icm_amt > 0)
+
+
+def check_amount_match(row, icm_amt_val, tolerance=0.02, require_same_sign=False):
     # A $0 Earned Credit on a row that already has Earned Commission must not
     # consume an ICM $0 split. Only a row whose own line amount is ~0 can match $0.
     col, val_str, val_num = apl_line_amount(row)
-    # Compare integer cents. 1.06 - 1.05 is 0.010000000000000009 as a float, which fails <= 0.01.
-    apl_cents = int(round(val_num * 100))
-    icm_cents = int(round(float(icm_amt_val) * 100))
+    # Compare magnitudes in cents. APL AV/chargeback (-3.01) must match ICM +3.01.
+    # Signed compare would also make Pass-2 closest prefer 1.08 over 3.01.
+    icm_num = float(icm_amt_val)
+    apl_cents = abs(int(round(val_num * 100)))
+    icm_cents = abs(int(round(icm_num * 100)))
     if abs(apl_cents - icm_cents) <= int(round(tolerance * 100)):
+        if require_same_sign and not amounts_same_sign(val_num, icm_num):
+            return "None", val_str
         return col, val_str if val_str else f"{val_num}"
     return "None", val_str
 
@@ -264,11 +284,12 @@ def _payable_role(row):
 
 
 def prepare_icm_payables(df):
-    """Drop MMP lines, and add advance-earned splits back into one amount per payee.
+    """Drop MMP lines, and combine advance-earned with leftover commission only.
 
     APL payables do not include the MMP contribution. An advance recovery is stored
     as ADVANCE_EARNED plus the leftover COMMISSION for the same policy, agent, and
-    role. APL pays that person once, so those ICM amounts are compared as one total.
+    role. Pure ADVANCE_EARNED groups (multiple recoveries for one agent) stay as
+    separate lines so each can pair to its own APL amount.
     """
     if df is None or df.empty or "commission_type" not in df.columns:
         return df
@@ -299,7 +320,9 @@ def prepare_icm_payables(df):
     for key in order:
         subset = work.loc[groups[key]]
         type_list = [_payable_type(value) for value in subset["commission_type"]]
-        if "ADVANCE_EARNED" in type_list and len(subset) > 1:
+        has_advance = "ADVANCE_EARNED" in type_list
+        has_other = any(t and t != "ADVANCE_EARNED" for t in type_list)
+        if has_advance and has_other and len(subset) > 1:
             total = round(sum(clean_amount(value) for value in subset[ParallelColumns.AMOUNT]), 2)
             representative = subset.iloc[type_list.index("ADVANCE_EARNED")].copy()
             representative[ParallelColumns.AMOUNT] = f"{total:.2f}"
@@ -352,27 +375,37 @@ def pair_apl_and_icm(df_apl, df_par, amount_tolerance):
         if not target_apl_items:
             continue
 
-        for apl_item in target_apl_items:
-            if apl_item['matched_par']: continue
-            apl_row = apl_item['row']
-            apl_agent = str(apl_row.get(APLColumns.AGENT_NAME, "")).strip()
-            if apl_agent.lower() == 'nan': apl_agent = ""
+        def bind_agent_amount_pass(require_same_sign):
+            for apl_item in target_apl_items:
+                if apl_item['matched_par']:
+                    continue
+                apl_row = apl_item['row']
+                apl_agent = str(apl_row.get(APLColumns.AGENT_NAME, "")).strip()
+                if apl_agent.lower() == 'nan':
+                    apl_agent = ""
 
-            for par_item in par_list:
-                if par_item['consumed']: continue
-                icm_ag = str(par_item['row'].get(ParallelColumns.AGENT_NAME, "")).strip()
-                if icm_ag.lower() == 'nan': icm_ag = ""
-                icm_amt_str = str(par_item['row'].get(ParallelColumns.AMOUNT, "")).strip()
-                if icm_amt_str.lower() == 'nan': icm_amt_str = ""
-                icm_amt_val = clean_amount(icm_amt_str)
+                for par_item in par_list:
+                    if par_item['consumed']:
+                        continue
+                    icm_ag = str(par_item['row'].get(ParallelColumns.AGENT_NAME, "")).strip()
+                    if icm_ag.lower() == 'nan':
+                        icm_ag = ""
+                    icm_amt_str = str(par_item['row'].get(ParallelColumns.AMOUNT, "")).strip()
+                    if icm_amt_str.lower() == 'nan':
+                        icm_amt_str = ""
+                    icm_amt_val = clean_amount(icm_amt_str)
 
-                ag_match = normalize_name(apl_agent) == normalize_name(icm_ag)
-                matched_col, _ = check_amount_match(apl_row, icm_amt_val, amount_tolerance)
-                amt_match = matched_col != "None"
+                    ag_match = normalize_name(apl_agent) == normalize_name(icm_ag)
+                    matched_col, _ = check_amount_match(
+                        apl_row, icm_amt_val, amount_tolerance, require_same_sign=require_same_sign
+                    )
+                    if ag_match and matched_col != "None":
+                        bind_match(apl_item, par_item)
+                        break
 
-                if ag_match and amt_match:
-                    bind_match(apl_item, par_item)
-                    break
+        # Prefer same-sign twins (+7.50↔+7.50, -7.50↔-7.50) before opposite-sign magnitude.
+        bind_agent_amount_pass(require_same_sign=True)
+        bind_agent_amount_pass(require_same_sign=False)
 
         for apl_item in target_apl_items:
             if apl_item['matched_par']: continue
@@ -382,7 +415,7 @@ def pair_apl_and_icm(df_apl, df_par, amount_tolerance):
             _, _, apl_amt = apl_line_amount(apl_row)
 
             best_par = None
-            best_diff = None
+            best_key = None
             for par_item in par_list:
                 if par_item['consumed']: continue
                 icm_ag = str(par_item['row'].get(ParallelColumns.AGENT_NAME, "")).strip()
@@ -391,27 +424,41 @@ def pair_apl_and_icm(df_apl, df_par, amount_tolerance):
                     continue
                 icm_amt_str = str(par_item['row'].get(ParallelColumns.AMOUNT, "")).strip()
                 if icm_amt_str.lower() == 'nan': icm_amt_str = ""
-                diff = abs(apl_amt - clean_amount(icm_amt_str))
-                if best_par is None or diff < best_diff:
+                icm_amt_val = clean_amount(icm_amt_str)
+                # Magnitude distance so APL -3.01 prefers ICM 3.01 over 1.08.
+                # Same sign wins ties so +7.50 does not steal ICM -7.50.
+                diff = abs(abs(apl_amt) - abs(icm_amt_val))
+                sign_penalty = 0 if amounts_same_sign(apl_amt, icm_amt_val) else 1
+                key = (diff, sign_penalty)
+                if best_par is None or key < best_key:
                     best_par = par_item
-                    best_diff = diff
+                    best_key = key
             if best_par is not None:
                 bind_match(apl_item, best_par)
 
-        for apl_item in target_apl_items:
-            if apl_item['matched_par']: continue
-            apl_row = apl_item['row']
+        def bind_amount_only_pass(require_same_sign):
+            for apl_item in target_apl_items:
+                if apl_item['matched_par']:
+                    continue
+                apl_row = apl_item['row']
 
-            for par_item in par_list:
-                if par_item['consumed']: continue
-                icm_amt_str = str(par_item['row'].get(ParallelColumns.AMOUNT, "")).strip()
-                if icm_amt_str.lower() == 'nan': icm_amt_str = ""
-                icm_amt_val = clean_amount(icm_amt_str)
+                for par_item in par_list:
+                    if par_item['consumed']:
+                        continue
+                    icm_amt_str = str(par_item['row'].get(ParallelColumns.AMOUNT, "")).strip()
+                    if icm_amt_str.lower() == 'nan':
+                        icm_amt_str = ""
+                    icm_amt_val = clean_amount(icm_amt_str)
 
-                matched_col, _ = check_amount_match(apl_row, icm_amt_val, amount_tolerance)
-                if matched_col != "None":
-                    bind_match(apl_item, par_item)
-                    break
+                    matched_col, _ = check_amount_match(
+                        apl_row, icm_amt_val, amount_tolerance, require_same_sign=require_same_sign
+                    )
+                    if matched_col != "None":
+                        bind_match(apl_item, par_item)
+                        break
+
+        bind_amount_only_pass(require_same_sign=True)
+        bind_amount_only_pass(require_same_sign=False)
 
         for apl_item in target_apl_items:
             if apl_item['matched_par']: continue
@@ -492,7 +539,61 @@ def compare_icm_to_apl(apl_path, icm_path, amount_tolerance=0.02):
     return icm_lines, apl_only
 
 
-def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_tolerance=0.02, mode="apl", single_grouped_file=False, apl_df=None):
+def sanitize_statement_grouped_filename(value):
+    """Safe .xlsx name from source_file_name, e.g. Aetna MedSupp ...xlsx."""
+    text = str(value or "").strip()
+    if not text or text.lower() == "nan":
+        return "_unknown_statement.xlsx"
+    text = os.path.basename(text)
+    root, ext = os.path.splitext(text)
+    stem = root if root else text
+    for char in ('/', '\\', '\0', ':', '*', '?', '"', '<', '>', '|'):
+        stem = stem.replace(char, "_")
+    stem = stem.strip(" .") or "_unknown_statement"
+    return f"{stem}.xlsx"
+
+
+def write_statement_grouped_policies(grouped_passed_rows, grouped_failed_rows, dest_root, get_group_key):
+    """Write one Grouped_Policy_Combined.xlsx per source_file_name under dest_root."""
+    os.makedirs(dest_root, exist_ok=True)
+    by_statement = {}
+    for r in grouped_passed_rows:
+        key = str(r.get("source_file_name") or "").strip()
+        by_statement.setdefault(key, {"passed": [], "failed": []})["passed"].append(r)
+    for r in grouped_failed_rows:
+        key = str(r.get("source_file_name") or "").strip()
+        by_statement.setdefault(key, {"passed": [], "failed": []})["failed"].append(r)
+
+    written = 0
+    for source_name, buckets in sorted(by_statement.items(), key=lambda item: item[0].lower()):
+        combined_rows = []
+        for r in buckets["passed"]:
+            row = dict(r)
+            row["Group_Status"] = "Passed"
+            combined_rows.append(row)
+        for r in buckets["failed"]:
+            row = dict(r)
+            row["Group_Status"] = "Failed"
+            combined_rows.append(row)
+        if not combined_rows:
+            continue
+
+        combined_rows.sort(key=get_group_key)
+        df_combined = pd.DataFrame(combined_rows)
+        cols = ["Group_Status"] + [c for c in df_combined.columns if c != "Group_Status"]
+        df_combined = df_combined[cols]
+
+        out_xlsx = os.path.join(dest_root, sanitize_statement_grouped_filename(source_name))
+        df_combined.to_excel(out_xlsx, index=False)
+        written += 1
+        print(
+            f"Saved statement grouped policies ({len(df_combined)} rows) -> {out_xlsx}"
+        )
+
+    print(f"Statement-wise grouped policies written under {dest_root} ({written} file(s))")
+
+
+def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_tolerance=0.02, mode="apl", single_grouped_file=False, apl_df=None, statement_grouped_dir=None):
     mode = normalize_mode(mode) or "apl"
     if mode not in VALID_MODES:
         raise ValueError(f"Unsupported validation mode '{mode}'. Expected one of: {', '.join(VALID_MODES)}")
@@ -592,9 +693,13 @@ def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_t
 
             icm_amt_val = clean_amount(icm_amount_str)
             matched_col, apl_amount_str = check_amount_match(apl_row, icm_amt_val, amount_tolerance)
+            apl_amt_val = clean_amount(apl_amount_str)
             if matched_col == "None":
-                apl_amt_val = clean_amount(apl_amount_str)
                 errors.append(f"Amount mismatch (APL: {apl_amt_val}, ICM: {icm_amt_val})")
+                stats['amount_mismatch'] += 1
+            elif apl_amt_val != 0 and icm_amt_val != 0 and (apl_amt_val > 0) != (icm_amt_val > 0):
+                # Magnitude paired correctly (e.g. -3.01 ↔ 3.01); still flag the sign flip.
+                errors.append(f"Amount sign mismatch (APL: {apl_amt_val}, ICM: {icm_amt_val})")
                 stats['amount_mismatch'] += 1
 
             if not errors and match_type != "Partial":
@@ -765,10 +870,12 @@ def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_t
         
         has_agent = "Agent name does not match" in err_str
         has_amt = "Amount mismatch" in err_str
+        has_sign = "Amount sign mismatch" in err_str
         
-        if has_agent and has_amt: return "Agent_and_Amount_Mismatch"
+        if has_agent and (has_amt or has_sign): return "Agent_and_Amount_Mismatch"
         if has_agent: return "Agent_Name_Mismatch"
         if has_amt: return "Amount_Mismatch"
+        if has_sign: return "Amount_Sign_Mismatch"
         return "Other_Errors"
         
     print(f"Segregating errors into folder: {errors_dir}...")
@@ -881,6 +988,16 @@ def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_t
                 if os.path.exists(grp_combined_csv): os.remove(grp_combined_csv)
                 if os.path.exists(grp_combined_xlsx): os.remove(grp_combined_xlsx)
 
+        statement_dir = (str(statement_grouped_dir).strip() if statement_grouped_dir else "") or os.path.join(
+            output_dir, "Statement_Grouped_Policies"
+        )
+        write_statement_grouped_policies(
+            grouped_passed_rows,
+            grouped_failed_rows,
+            statement_dir,
+            get_group_key,
+        )
+
     print("Done!")
 
 if __name__ == "__main__":
@@ -903,10 +1020,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Combine grouped policy passed and failed records into a single file (Grouped_Policy_Combined.csv/xlsx)",
     )
+    parser.add_argument(
+        "--statement-grouped-dir",
+        help=(
+            "Folder for statement-file-wise grouped policy outputs. "
+            "If omitted, creates Statement_Grouped_Policies under the run output folder."
+        ),
+    )
     args = parser.parse_args()
 
     mode = normalize_mode(args.mode) if args.mode else None
     single_grouped = args.single_grouped_file
+    statement_grouped_dir = (
+        args.statement_grouped_dir.strip().strip("'\"") if args.statement_grouped_dir else None
+    )
 
     if args.apl and args.parallel:
         apl_file = args.apl.strip().strip('\'"')
@@ -933,6 +1060,13 @@ if __name__ == "__main__":
         use_single = input("Do you want to combine grouped policy passed and failed into a single file? (y/n) [default: n]: ").strip().lower()
         if use_single in ['y', 'yes']:
             single_grouped = True
+
+        stmt_dir_input = input(
+            "Enter folder for statement-file-wise grouped policies "
+            "(blank = Statement_Grouped_Policies under output): "
+        ).strip().strip("'\"")
+        if stmt_dir_input:
+            statement_grouped_dir = stmt_dir_input
 
         if mode is None:
             mode = prompt_for_mode()
@@ -975,5 +1109,14 @@ if __name__ == "__main__":
     out_xlsx = os.path.join(output_folder, 'Validation_Output.xlsx')
     
     print("Starting validation...\n")
-    validate_data(apl_file, parallel_file, out_csv, out_xlsx, tolerance, mode=mode, single_grouped_file=single_grouped)
+    validate_data(
+        apl_file,
+        parallel_file,
+        out_csv,
+        out_xlsx,
+        tolerance,
+        mode=mode,
+        single_grouped_file=single_grouped,
+        statement_grouped_dir=statement_grouped_dir,
+    )
     print(f"\nValidation complete. Outputs saved in {output_folder}")
