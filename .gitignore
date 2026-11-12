@@ -31,3 +31,8 @@ graphify*
 
 # Logs
 *.log
+
+# Local forecast env files with credentials (use config_prod.example)
+**/config_prod
+**/config_preprod
+**/config_local
