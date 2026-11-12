@@ -3,7 +3,6 @@
 # The script only SELECTs from the database and never POSTs or PUTs to the API base URL.
 #
 # Copy to config_prod and fill in local values. config_prod is gitignored.
-# Prefer the maintained copy under forecase_scripts/.
 
 PIEQ_API_BASE_URL=https://prod.api.pieq.ai
 
