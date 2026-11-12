@@ -873,7 +873,7 @@ def load_env_file(environment):
         if key and key not in os.environ:
             os.environ[key] = value
             loaded += 1
-    logger.info("Loaded %s value(s) from %s", loaded, env_path.name)
+    logger.info("Loaded %s value(s) from %s from location %s", loaded, env_path.name, env_path.resolve())
 
 
 def require_env(name):
@@ -4505,7 +4505,7 @@ def load_apl_validator():
     global _APL_VALIDATOR
     if _APL_VALIDATOR is not None:
         return _APL_VALIDATOR
-    script = Path(__file__).resolve().parents[1] / "scripts" / "apl_icm_cross_validation" / "validate_apl_icm.py"
+    script = Path(__file__).resolve().parents[1] / "apl_icm_cross_validation" / "validate_apl_icm.py"
     spec = importlib.util.spec_from_file_location("validate_apl_icm", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
