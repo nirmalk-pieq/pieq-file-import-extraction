@@ -593,7 +593,204 @@ def write_statement_grouped_policies(grouped_passed_rows, grouped_failed_rows, d
     print(f"Statement-wise grouped policies written under {dest_root} ({written} file(s))")
 
 
-def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_tolerance=0.02, mode="apl", single_grouped_file=False, apl_df=None, statement_grouped_dir=None):
+def _agent_display_name(row):
+    apl = str(row.get("APL Agent Name") or "").strip()
+    icm = str(row.get("ICM Agent Name") or "").strip()
+    if apl and apl.lower() != "nan":
+        return apl
+    if icm and icm.lower() != "nan":
+        return icm
+    return ""
+
+
+def _agent_group_key(row):
+    name = _agent_display_name(row)
+    tokens = normalize_name(name)
+    if tokens:
+        return frozenset(tokens)
+    return frozenset({name.upper()}) if name else frozenset({"_unknown_agent"})
+
+
+def _empty_agent_file_bucket(display_name):
+    return {
+        "Agent Name": display_name or "_unknown_agent",
+        "APL Amount Sum": 0.0,
+        "ICM Amount Sum": 0.0,
+        "APL Line Count": 0,
+        "ICM Line Count": 0,
+        "APL Policies": set(),
+        "ICM Policies": set(),
+    }
+
+
+def _accumulate_agent_file_row(bucket, row):
+    apl_amt_str = str(row.get("APL Amount") or "").strip()
+    icm_amt_str = str(row.get("ICM Amount") or "").strip()
+    apl_pol = str(row.get("APL Policy Number") or "").strip()
+    icm_pol = str(row.get("ICM Policy Number") or "").strip()
+
+    has_apl = bool(
+        (apl_amt_str and apl_amt_str.lower() != "nan")
+        or (apl_pol and apl_pol.lower() != "nan")
+    )
+    has_icm = bool(
+        (icm_amt_str and icm_amt_str.lower() != "nan")
+        or (icm_pol and icm_pol.lower() != "nan")
+    )
+
+    if has_apl:
+        bucket["APL Amount Sum"] = round(bucket["APL Amount Sum"] + clean_amount(apl_amt_str), 2)
+        bucket["APL Line Count"] += 1
+        cleaned = clean_policy_number(apl_pol)
+        if cleaned:
+            bucket["APL Policies"].add(cleaned)
+    if has_icm:
+        bucket["ICM Amount Sum"] = round(bucket["ICM Amount Sum"] + clean_amount(icm_amt_str), 2)
+        bucket["ICM Line Count"] += 1
+        cleaned = clean_policy_number(icm_pol)
+        if cleaned:
+            bucket["ICM Policies"].add(cleaned)
+
+    display = _agent_display_name(row)
+    if display and (
+        not bucket["Agent Name"]
+        or bucket["Agent Name"] == "_unknown_agent"
+        or (bucket["Agent Name"].islower() and not display.islower())
+    ):
+        bucket["Agent Name"] = display
+
+
+def write_agent_totals_by_file_matrix(agent_file_totals, file_names, dest_root):
+    """One workbook: Agent Name + per-file merged headers with 4 metric columns."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
+    from openpyxl.utils import get_column_letter
+
+    if not agent_file_totals or not file_names:
+        return None
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Agent Totals By File"
+
+    ws["A1"] = "Agent Name"
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws["A1"].font = Font(bold=True)
+
+    metric_headers = ("ICM Amount", "APL Amount", "ICM No of Policies", "APL No of Policies")
+    col = 2
+    for source_name in file_names:
+        end_col = col + 3
+        ws.cell(row=1, column=col, value=source_name or "_unknown_statement")
+        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=end_col)
+        ws.cell(row=1, column=col).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.cell(row=1, column=col).font = Font(bold=True)
+        for offset, header in enumerate(metric_headers):
+            cell = ws.cell(row=2, column=col + offset, value=header)
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+            cell.font = Font(bold=True)
+        col = end_col + 1
+
+    agent_keys = sorted(
+        agent_file_totals.keys(),
+        key=lambda key: str(
+            next(iter(agent_file_totals[key].values()))["Agent Name"]
+            if agent_file_totals[key]
+            else ""
+        ).lower(),
+    )
+
+    for row_idx, agent_key in enumerate(agent_keys, start=3):
+        file_map = agent_file_totals[agent_key]
+        display = "_unknown_agent"
+        for source_name in file_names:
+            if source_name in file_map and file_map[source_name].get("Agent Name"):
+                display = file_map[source_name]["Agent Name"]
+                break
+        ws.cell(row=row_idx, column=1, value=display)
+
+        col = 2
+        for source_name in file_names:
+            bucket = file_map.get(source_name)
+            if bucket is None:
+                values = (None, None, None, None)
+            else:
+                values = (
+                    bucket["ICM Amount Sum"],
+                    bucket["APL Amount Sum"],
+                    len(bucket["ICM Policies"]),
+                    len(bucket["APL Policies"]),
+                )
+            for offset, value in enumerate(values):
+                ws.cell(row=row_idx, column=col + offset, value=value)
+            col += 4
+
+    ws.column_dimensions["A"].width = 28
+    for idx in range(2, 2 + len(file_names) * 4):
+        ws.column_dimensions[get_column_letter(idx)].width = 16
+
+    out_xlsx = os.path.join(dest_root, "Agent_Totals_By_File.xlsx")
+    wb.save(out_xlsx)
+    return out_xlsx
+
+
+def write_statement_agent_totals(all_rows, dest_root):
+    """Write per-statement agent totals and one agents-by-file matrix workbook."""
+    os.makedirs(dest_root, exist_ok=True)
+
+    # agent_key -> source_file_name -> bucket
+    agent_file_totals = {}
+    file_names = sorted(
+        {str(r.get("source_file_name") or "").strip() for r in all_rows},
+        key=lambda name: name.lower(),
+    )
+
+    for r in all_rows:
+        source_name = str(r.get("source_file_name") or "").strip()
+        agent_key = _agent_group_key(r)
+        file_map = agent_file_totals.setdefault(agent_key, {})
+        bucket = file_map.get(source_name)
+        if bucket is None:
+            bucket = _empty_agent_file_bucket(_agent_display_name(r))
+            file_map[source_name] = bucket
+        _accumulate_agent_file_row(bucket, r)
+
+    written = 0
+    for source_name in file_names:
+        totals_rows = []
+        for agent_key, file_map in agent_file_totals.items():
+            bucket = file_map.get(source_name)
+            if bucket is None:
+                continue
+            totals_rows.append({
+                "Agent Name": bucket["Agent Name"],
+                "APL Amount Sum": bucket["APL Amount Sum"],
+                "ICM Amount Sum": bucket["ICM Amount Sum"],
+                "Amount Diff (ICM - APL)": round(bucket["ICM Amount Sum"] - bucket["APL Amount Sum"], 2),
+                "APL Line Count": bucket["APL Line Count"],
+                "ICM Line Count": bucket["ICM Line Count"],
+                "APL No of Policies": len(bucket["APL Policies"]),
+                "ICM No of Policies": len(bucket["ICM Policies"]),
+            })
+        if not totals_rows:
+            continue
+
+        totals_rows.sort(key=lambda row: str(row["Agent Name"]).lower())
+        df_totals = pd.DataFrame(totals_rows)
+        out_xlsx = os.path.join(dest_root, sanitize_statement_grouped_filename(source_name))
+        df_totals.to_excel(out_xlsx, index=False)
+        written += 1
+        print(f"Saved statement agent totals ({len(df_totals)} agents) -> {out_xlsx}")
+
+    matrix_path = write_agent_totals_by_file_matrix(agent_file_totals, file_names, dest_root)
+    if matrix_path:
+        print(f"Saved agent totals by file matrix -> {matrix_path}")
+
+    print(f"Statement-wise agent totals written under {dest_root} ({written} file(s))")
+
+
+def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_tolerance=0.02, mode="apl", single_grouped_file=False, apl_df=None, statement_grouped_dir=None, agent_totals_dir=None):
     mode = normalize_mode(mode) or "apl"
     if mode not in VALID_MODES:
         raise ValueError(f"Unsupported validation mode '{mode}'. Expected one of: {', '.join(VALID_MODES)}")
@@ -612,7 +809,7 @@ def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_t
             print(f" -> Loaded {len(df_apl)} records from APL.")
     except Exception as e:
         print(f"Error loading APL file: {e}")
-        return
+        return []
 
     print("Loading Parallel Run Payables...")
     try:
@@ -620,7 +817,7 @@ def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_t
         print(f" -> Loaded {len(df_par)} records from Parallel Run.")
     except Exception as e:
         print(f"Error loading Parallel Run file: {e}")
-        return
+        return []
 
     results = []
     passed_results = []
@@ -998,6 +1195,11 @@ def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_t
             get_group_key,
         )
 
+        agent_dir = (str(agent_totals_dir).strip() if agent_totals_dir else "") or os.path.join(
+            output_dir, "Statement_Agent_Totals"
+        )
+        write_statement_agent_totals(all_processed_rows, agent_dir)
+
     print("Done!")
 
 if __name__ == "__main__":
@@ -1027,12 +1229,22 @@ if __name__ == "__main__":
             "If omitted, creates Statement_Grouped_Policies under the run output folder."
         ),
     )
+    parser.add_argument(
+        "--agent-totals-dir",
+        help=(
+            "Folder for statement-file-wise agent amount totals. "
+            "If omitted, creates Statement_Agent_Totals under the run output folder."
+        ),
+    )
     args = parser.parse_args()
 
     mode = normalize_mode(args.mode) if args.mode else None
     single_grouped = args.single_grouped_file
     statement_grouped_dir = (
         args.statement_grouped_dir.strip().strip("'\"") if args.statement_grouped_dir else None
+    )
+    agent_totals_dir = (
+        args.agent_totals_dir.strip().strip("'\"") if args.agent_totals_dir else None
     )
 
     if args.apl and args.parallel:
@@ -1067,6 +1279,13 @@ if __name__ == "__main__":
         ).strip().strip("'\"")
         if stmt_dir_input:
             statement_grouped_dir = stmt_dir_input
+
+        agent_dir_input = input(
+            "Enter folder for statement-file-wise agent totals "
+            "(blank = Statement_Agent_Totals under output): "
+        ).strip().strip("'\"")
+        if agent_dir_input:
+            agent_totals_dir = agent_dir_input
 
         if mode is None:
             mode = prompt_for_mode()
@@ -1118,5 +1337,6 @@ if __name__ == "__main__":
         mode=mode,
         single_grouped_file=single_grouped,
         statement_grouped_dir=statement_grouped_dir,
+        agent_totals_dir=agent_totals_dir,
     )
     print(f"\nValidation complete. Outputs saved in {output_folder}")

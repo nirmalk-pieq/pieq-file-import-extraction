@@ -26,6 +26,19 @@ from review_to_reconcile_file_forecast import (
 )
 
 
+def _bare_forecast():
+    fc = forecast.Forecast.__new__(forecast.Forecast)
+    fc.preloaded_agency_id = None
+    fc.preloaded_policy_ids = set()
+    fc.preloaded_npns = set()
+    fc.preloaded_names = set()
+    fc.npn_to_agents = {}
+    fc.appointment_to_agents = {}
+    fc.code_to_agents = {}
+    fc.name_to_agents = {}
+    return fc
+
+
 class TestAgentNamesNormalize(unittest.TestCase):
     """Parity tests for AgentNames.normalize against AgentNamesTest.kt."""
 
@@ -181,7 +194,7 @@ class TestAgentNameResolveSqlAndPolicyCreation(unittest.TestCase):
         self.assertIn("regexp_replace", sql_lower)
 
     def test_create_local_policy_normalizes_and_resolves_unique_agent(self):
-        fc = forecast.Forecast.__new__(forecast.Forecast)
+        fc = _bare_forecast()
         fc.exceptions = []
 
         record = {
@@ -222,7 +235,7 @@ class TestAgentNameResolveSqlAndPolicyCreation(unittest.TestCase):
         self.assertIn("reason=effective_date", fc.exceptions[0]["message"])
 
     def test_create_local_policy_ambiguous_matches(self):
-        fc = forecast.Forecast.__new__(forecast.Forecast)
+        fc = _bare_forecast()
         fc.exceptions = []
 
         record = {
@@ -258,7 +271,7 @@ class TestAgentNameResolveSqlAndPolicyCreation(unittest.TestCase):
         self.assertIn("matched 2 users", fc.exceptions[0]["message"])
 
     def test_create_local_policy_zero_matches(self):
-        fc = forecast.Forecast.__new__(forecast.Forecast)
+        fc = _bare_forecast()
         fc.exceptions = []
 
         record = {
@@ -291,7 +304,7 @@ class TestAgentNameResolveSqlAndPolicyCreation(unittest.TestCase):
         self.assertIn("could not be resolved", fc.exceptions[0]["message"])
 
     def test_create_local_policy_blank_name_and_missing_npn(self):
-        fc = forecast.Forecast.__new__(forecast.Forecast)
+        fc = _bare_forecast()
         fc.exceptions = []
 
         record = {

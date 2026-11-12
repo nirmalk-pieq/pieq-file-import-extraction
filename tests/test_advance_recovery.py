@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Tests for Issue 1: Add Advance Recovery to Commission Processing — Strict Backend Parity.
 
 Derived from AdvanceRecoveryProcessorTest.kt, MultiRecipientAdvanceRecoveryTest.kt,
@@ -36,6 +36,13 @@ class TestAdvanceRecovery(unittest.TestCase):
         self.fc.exceptions = []
         self.fc.tx = 0
         self.fc.today = date.today()
+        self.fc.preloaded_agency_id = None
+        self.fc.preloaded_policy_ids = set()
+        self.fc.advance_totals = {}
+        self.fc.mmp_config_by_agent = {}
+        self.fc.mmp_db_totals = {}
+        self.fc.mmp_bounds = None
+        self.fc.agent_mmp_configs = {}
 
     def _sample_record(self, agency_id=100, policy_uuid="pol-1", statement_uuid="rec-1", **kwargs):
         record = {

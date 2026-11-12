@@ -43,6 +43,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from urllib import error, parse, request
 
+import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -237,17 +238,20 @@ def calendar_day(value):
 
 
 def policy_month_index(paid, effective):
-    """Calendar months from the effective month to the paid-to month. The effective month is 0."""
+    """1-based policy month, same as file processing (2026.11.03.01).
+
+    Effective calendar month is month 1. February paid-to on a January effective date is month 2.
+    """
     paid_day = calendar_day(paid)
     effective_day = calendar_day(effective)
     if paid_day is None or effective_day is None or paid_day < effective_day:
         return None
-    return (paid_day.year - effective_day.year) * 12 + (paid_day.month - effective_day.month)
+    return (paid_day.year - effective_day.year) * 12 + (paid_day.month - effective_day.month) + 1
 
 
 def sql_policy_month(paid_day, effective_day):
-    """Same integer as POLICY_MONTH_EXPR, including a negative month when paid-to is earlier."""
-    return (paid_day.year - effective_day.year) * 12 + (paid_day.month - effective_day.month)
+    """Same integer as POLICY_MONTH_EXPR (1-based). Negative when paid-to is earlier than effective."""
+    return (paid_day.year - effective_day.year) * 12 + (paid_day.month - effective_day.month) + 1
 
 
 def commission_type_code(value):
@@ -1132,24 +1136,39 @@ WHERE csr.file_uuid = %s::uuid
 ORDER BY csr.id, csr.row_order
 """
 
-# Calendar month difference from effective date to paid-to date. The effective month is 0.
-# February paid-to on a January effective date is month 1. Same formula as file processing.
+# 1-based policy month (effective calendar month = 1). Same formula as file processing 2026.11.03.01.
 POLICY_MONTH_EXPR = """(
     (EXTRACT(YEAR FROM %s::date) - EXTRACT(YEAR FROM %s::date)) * 12
     + (EXTRACT(MONTH FROM %s::date) - EXTRACT(MONTH FROM %s::date))
+    + 1
 )"""
 
-MATCH_SQL = f"""
+# Slab match window: cover calculated month m, plus lookback (m-1) and lookahead (m+1) at slab boundaries.
+MATCH_SQL = """
 SELECT pc.uuid::text AS uuid, pc.fee_amount, pc.payout_method, pc.premium_amount,
        pc.commission_type_text, pc.commission_split, pc.month_from, pc.month_to
-FROM policy_commission pc
-WHERE pc.agency_id = %s AND pc.policy_uuid = %s::uuid AND pc.month_from IS NOT NULL
+FROM (
+    SELECT %s::bigint AS agency_id, %s::uuid AS policy_uuid, %s::date AS paid_p, %s::date AS effective_p
+) params
+JOIN policy_commission pc
+  ON pc.agency_id = params.agency_id
+ AND pc.policy_uuid = params.policy_uuid
+ AND pc.month_from IS NOT NULL
+CROSS JOIN LATERAL (
+    SELECT (
+        (EXTRACT(YEAR FROM params.paid_p) - EXTRACT(YEAR FROM params.effective_p)) * 12
+        + (EXTRACT(MONTH FROM params.paid_p) - EXTRACT(MONTH FROM params.effective_p))
+        + 1
+    )::int AS m
+) calc
+WHERE params.paid_p >= params.effective_p
   AND (
-      {POLICY_MONTH_EXPR} >= pc.month_from
-      AND (
-          pc.month_to IS NULL
-          OR {POLICY_MONTH_EXPR} <= pc.month_to
+      (calc.m >= pc.month_from AND (pc.month_to IS NULL OR calc.m <= pc.month_to))
+      OR (
+          calc.m > 1
+          AND (calc.m - 1 >= pc.month_from AND (pc.month_to IS NULL OR calc.m - 1 <= pc.month_to))
       )
+      OR (calc.m + 1 >= pc.month_from AND (pc.month_to IS NULL OR calc.m + 1 <= pc.month_to))
   )
 """
 
@@ -1218,7 +1237,6 @@ SELECT
         FROM policy_commission pc
         WHERE pc.agency_id = pol.agency_id
           AND pc.policy_uuid = pol.uuid
-          AND pc.month_from = 1
           AND pc.commission_type = 1
     ) AS max_month_to,
     prod.uuid::text AS product_uuid,
@@ -1325,7 +1343,6 @@ SELECT
         FROM policy_commission pc
         WHERE pc.agency_id = pol.agency_id
           AND pc.policy_uuid = pol.uuid
-          AND pc.month_from = 1
           AND pc.commission_type = 1
     ) AS max_month_to,
     prod.uuid::text AS product_uuid,
@@ -1473,7 +1490,7 @@ def project_row(row, fields):
 
 
 def slab_covers_policy_month(row, policy_month):
-    """Same predicate as MATCH_SQL. A month_to of 0 is a real end, not an open slab."""
+    """Exact slab coverage for a policy month. A month_to of 0 is a real end, not an open slab."""
     start = row.get("month_from")
     if start is None or policy_month is None:
         return False
@@ -1483,6 +1500,17 @@ def slab_covers_policy_month(row, policy_month):
     if end is None:
         return True
     return policy_month <= int(end)
+
+
+def slab_in_match_window(row, policy_month):
+    """File-processing MATCH window: slab covering m, m-1 (when m > 1), or m + 1."""
+    if policy_month is None:
+        return False
+    if slab_covers_policy_month(row, policy_month):
+        return True
+    if policy_month > 1 and slab_covers_policy_month(row, policy_month - 1):
+        return True
+    return slab_covers_policy_month(row, policy_month + 1)
 
 
 def all_slabs_sort_key(row):
@@ -2091,9 +2119,7 @@ class Forecast:
         for row in self.local_commissions:
             if row.get("policy_uuid") != policy_uuid or row.get("month_from") is None:
                 continue
-            start = int(row["month_from"])
-            end = open_month_to(row.get("month_to"))
-            if policy_month >= start and (end is None or policy_month <= end):
+            if slab_in_match_window(row, policy_month):
                 matches.append(row)
         return matches
 
@@ -2117,8 +2143,11 @@ class Forecast:
     def commissions_from_preload(self, sql, params, policy_uuid):
         rows = self.commissions_by_policy.get(policy_uuid, [])
         if sql == MATCH_SQL:
-            policy_month = sql_policy_month(params[2], params[3])
-            covered = [row for row in rows if slab_covers_policy_month(row, policy_month)]
+            paid_day, effective_day = params[2], params[3]
+            if paid_day is None or effective_day is None or paid_day < effective_day:
+                return []
+            policy_month = sql_policy_month(paid_day, effective_day)
+            covered = [row for row in rows if slab_in_match_window(row, policy_month)]
             covered.sort(key=lambda row: (*all_slabs_sort_key(row), str(row.get("uuid") or "")))
             return [copy.deepcopy(project_row(row, MATCH_ROW_FIELDS)) for row in covered]
         if sql == ALL_SLABS_SQL:
@@ -2547,7 +2576,7 @@ class Forecast:
             return None
         ends = []
         for row in self.local_slabs(policy_uuid):
-            if row.get("month_from") is None or int(row["month_from"]) != REATTACH_MONTH_FROM:
+            if row.get("month_from") is None:
                 continue
             if slab_type_code(row) != COMMISSION_TYPE_REGULAR:
                 continue
@@ -2647,7 +2676,8 @@ class Forecast:
         max_month = context.get("max_month_to")
         if max_month is None:
             max_month = REATTACH_DEFAULT_MAX_MONTH_TO
-        if month_index <= int(max_month):
+        # File processing skips reattach while policy month <= max_month_to + 1 (1-based months).
+        if month_index <= int(max_month) + 1:
             return
         if not as_bool(context.get("attach_latest_commissions")):
             return
@@ -2807,18 +2837,7 @@ class Forecast:
         effective_day = effective.date() if isinstance(effective, datetime) else effective
         matches = self.persisted_commissions(
             MATCH_SQL,
-            (
-                record["agency_id"],
-                record["forecast_policy_uuid"],
-                paid_day,
-                effective_day,
-                paid_day,
-                effective_day,
-                paid_day,
-                effective_day,
-                paid_day,
-                effective_day,
-            ),
+            (record["agency_id"], record["forecast_policy_uuid"], paid_day, effective_day),
             record.get("forecast_policy_uuid"),
         )
         policy_month = sql_policy_month(paid_day, effective_day)
@@ -3033,18 +3052,7 @@ class Forecast:
         policy_month = sql_policy_month(paid_day, effective_day)
         month_matches = self.persisted_commissions(
             MATCH_SQL,
-            (
-                record["agency_id"],
-                record["forecast_policy_uuid"],
-                paid_day,
-                effective_day,
-                paid_day,
-                effective_day,
-                paid_day,
-                effective_day,
-                paid_day,
-                effective_day,
-            ),
+            (record["agency_id"], record["forecast_policy_uuid"], paid_day, effective_day),
             record.get("forecast_policy_uuid"),
         )
         month_matches = self.local_month_matches(record.get("forecast_policy_uuid"), policy_month) + month_matches
@@ -3105,18 +3113,7 @@ class Forecast:
             return
         matches = self.persisted_commissions(
             MATCH_SQL,
-            (
-                record["agency_id"],
-                record["forecast_policy_uuid"],
-                paid_day,
-                effective_day,
-                paid_day,
-                effective_day,
-                paid_day,
-                effective_day,
-                paid_day,
-                effective_day,
-            ),
+            (record["agency_id"], record["forecast_policy_uuid"], paid_day, effective_day),
             record.get("forecast_policy_uuid"),
         )
         policy_month = sql_policy_month(paid_day, effective_day)
@@ -3360,6 +3357,9 @@ class Forecast:
         if not agency_id or not agent_uuid:
             return None
         key = canon_id(agent_uuid)
+        overrides = getattr(self, "agent_mmp_configs", None)
+        if overrides is not None and key in overrides:
+            return overrides[key]
         if agency_id == self.preloaded_agency_id and key in self.mmp_config_by_agent:
             return self.mmp_config_by_agent[key]
         if getattr(self, "conn", None):
@@ -4473,7 +4473,7 @@ def write_forecast_output(statement_uuid, forecast, out=None):
         encoding="utf-8",
     )
     logger.info("Wrote forecast files to %s", out.resolve())
-    run_apl_cross_validation(out, forecast.statement.get("name"))
+    return out
 
 
 def resolve_apl_statement(statement_name):
@@ -4590,7 +4590,14 @@ def resolve_statement_name(conn, statement_uuid, statement_name=None):
     return rows[0]["name"] if rows else None
 
 
-def run_statement(conn, statement_uuid, auth, api_base_url, statement_name=None, api_cache=None):
+def run_statement(
+    conn,
+    statement_uuid,
+    auth,
+    api_base_url,
+    statement_name=None,
+    api_cache=None,
+):
     name = resolve_statement_name(conn, statement_uuid, statement_name)
     out = forecast_output_dir(statement_uuid, name)
     log_path = out / "forecast.log"
@@ -4601,6 +4608,7 @@ def run_statement(conn, statement_uuid, auth, api_base_url, statement_name=None,
         forecast.process_commissions()
         forecast.load_reference()
         write_forecast_output(statement_uuid, forecast, out=out)
+        run_apl_cross_validation(out, forecast.statement.get("name"))
     finally:
         detach_forecast_log(handler)
 
@@ -4652,8 +4660,17 @@ def ensure_connection(conn, url, password):
     return connect_readonly(url, password)
 
 
-def forecast_statement(conn, db_url, db_password, statement_uuid, auth, api_base, api_cache, statement_name=None):
-    """Run one statement. Returns (connection, failed). One retry after a dropped database session."""
+def forecast_statement(
+    conn,
+    db_url,
+    db_password,
+    statement_uuid,
+    auth,
+    api_base,
+    api_cache,
+    statement_name=None,
+):
+    """Run one statement. Returns (connection, failed)."""
     for attempt in (1, 2):
         try:
             conn = ensure_connection(conn, db_url, db_password)

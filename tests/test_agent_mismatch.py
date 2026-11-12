@@ -28,11 +28,24 @@ from review_to_reconcile_file_forecast import (
 )
 
 
+def _bare_forecast():
+    fc = forecast.Forecast.__new__(forecast.Forecast)
+    fc.preloaded_agency_id = None
+    fc.preloaded_policy_ids = set()
+    fc.preloaded_npns = set()
+    fc.preloaded_names = set()
+    fc.npn_to_agents = {}
+    fc.appointment_to_agents = {}
+    fc.code_to_agents = {}
+    fc.name_to_agents = {}
+    return fc
+
+
 class TestAgentMismatchResolutionHelpers(unittest.TestCase):
     """Tests resolve_agent_by_npn and resolve_agent_by_name against PolicyCreationDao.kt."""
 
     def setUp(self):
-        self.fc = forecast.Forecast.__new__(forecast.Forecast)
+        self.fc = _bare_forecast()
         self.fc.exceptions = []
 
     def test_resolve_agent_by_npn_unique(self):
@@ -117,7 +130,7 @@ class TestCheckAgentMismatch(unittest.TestCase):
     """Tests Forecast.check_agent_mismatch behavior."""
 
     def setUp(self):
-        self.fc = forecast.Forecast.__new__(forecast.Forecast)
+        self.fc = _bare_forecast()
 
     def test_mismatch_detected_when_both_resolve_to_different_uuids(self):
         self.fc.resolve_agent_by_npn = lambda aid, npn, cid=None: ("agent-A-uuid", "Resolved", [])
@@ -186,7 +199,7 @@ class TestReconciliationAgentMismatch(unittest.TestCase):
     """Tests reconciliation behavior mirroring ValidateAgent.kt and ValidateAgentTest.kt."""
 
     def setUp(self):
-        self.fc = forecast.Forecast.__new__(forecast.Forecast)
+        self.fc = _bare_forecast()
         self.fc.exceptions = []
         self.fc.local_policies = []
         self.fc.local_commissions = []
@@ -388,7 +401,7 @@ class TestCreateLocalPolicyAgentMismatch(unittest.TestCase):
     """Tests create_local_policy mismatch validation mirroring PolicyCreationDaoTest.kt."""
 
     def setUp(self):
-        self.fc = forecast.Forecast.__new__(forecast.Forecast)
+        self.fc = _bare_forecast()
         self.fc.exceptions = []
         self.fc.find_local_policy = lambda r: None
 
