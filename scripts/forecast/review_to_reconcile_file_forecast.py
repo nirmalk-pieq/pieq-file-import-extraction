@@ -87,6 +87,10 @@ class ForecastError(RuntimeError):
     pass
 
 
+class EmptyStatementError(ForecastError):
+    """Statement has no commission_statement_records to forecast."""
+
+
 class TokenRejected(ForecastError):
     def __init__(self, status, url, detail):
         self.status = status
@@ -1945,7 +1949,9 @@ class Forecast:
     def reconcile(self):
         rows = self.select(RECORD_SQL, (self.statement_uuid,))
         if not rows:
-            raise ForecastError(f"No commission_statement_records found for {self.statement_uuid}")
+            raise EmptyStatementError(
+                f"No commission_statement_records found for {self.statement_uuid}"
+            )
         rows.sort(key=lambda row: row.get("row_order") or 0)
         logger.info("Loaded %s commission_statement_records for %s", len(rows), self.statement_uuid)
         self.records = rows
@@ -4438,21 +4444,16 @@ def write_forecast_output(statement_uuid, forecast, out=None):
     if out is None:
         out = forecast_output_dir(statement_uuid, forecast.statement.get("name"))
     out.mkdir(parents=True, exist_ok=True)
-    write_exceptions(out / "reconciliation_exceptions.md", forecast)
-    write_forecast_md(out / "forecast.md", statement_uuid, forecast)
     write_forecast_xlsx(out / "forecast.xlsx", statement_uuid, forecast)
-    write_forecast_sql(out / "forecast.sql", forecast)
-    details, ledger, balances, splits, start, end = report_rows(forecast)
+    details, _ledger, _balances, _splits, start, end = report_rows(forecast)
     if forecast.statement["forecast_status"] != FILE_STATUS_CLEARED:
         logger.info(
             "Split report includes processed lines. The published query returns no rows while statement status is %s because %s record(s) are still in exception.",
             forecast.statement["forecast_status"],
             len(forecast.exceptions),
         )
+    # Internal APL input only — not a user-facing deliverable.
     write_csv(out / "commission_detail_report.csv", details)
-    write_csv(out / "ledger_summary.csv", ledger)
-    write_csv(out / "agent_balances.csv", balances)
-    write_csv(out / "commission_split_report.csv", splits)
     (out / "summary.json").write_text(
         json.dumps(
             {
@@ -4543,37 +4544,216 @@ def resolve_apl_validation_mode():
     return mode
 
 
+POLICIES_TO_UPDATE_COLUMNS = (
+    "Policy Number",
+    "Mismatch Category",
+    "APL Agent Name",
+    "ICM Agent Name",
+    "APL Amount",
+    "ICM Amount",
+    "Difference",
+    "Issue",
+    "File Name",
+)
+
+
+def policies_to_update_issue(category, difference, errors):
+    """Short issue label, plus line-level error detail when totals hide the mismatch."""
+    parts = []
+    if category == "Agent_Only":
+        parts.append("Agent name does not match")
+    elif category == "Amount_Only":
+        if abs(float(difference or 0)) < 0.005:
+            parts.append("Line-level amount mismatch (policy totals match)")
+        else:
+            parts.append("Amount mismatch")
+    elif category == "Both":
+        parts.append("Agent name and amount mismatch")
+        if abs(float(difference or 0)) < 0.005:
+            parts.append("Line-level amount mismatch (policy totals match)")
+    detail = " | ".join(sorted(errors)) if errors else ""
+    if detail:
+        parts.append(detail)
+    return " | ".join(parts)
+
+
+def build_policies_to_update_rows(validation_rows, clean_policy_number, clean_amount):
+    """One row per ICM policy (+ file) with Agent_Only / Amount_Only / Both. Sign-only excluded."""
+    by_key = {}
+    for row in validation_rows or []:
+        err_str = str(row.get("Error") or "").strip()
+        if not err_str or err_str.startswith("Partial Match"):
+            continue
+        has_agent = "Agent name does not match" in err_str
+        has_amount = bool(re.search(r"(?<!sign )Amount mismatch", err_str))
+        if not has_agent and not has_amount:
+            continue
+
+        icm_pol_raw = str(row.get("ICM Policy Number") or "").strip()
+        if not icm_pol_raw or icm_pol_raw.lower() == "nan":
+            continue
+        policy = clean_policy_number(icm_pol_raw) or icm_pol_raw
+        file_name = str(row.get("source_file_name") or "").strip()
+        if file_name.lower() == "nan":
+            file_name = ""
+        key = (policy, file_name)
+        bucket = by_key.get(key)
+        if bucket is None:
+            bucket = {
+                "Policy Number": policy,
+                "File Name": file_name,
+                "apl_agents": set(),
+                "icm_agents": set(),
+                "apl_amount_sum": 0.0,
+                "icm_amount_sum": 0.0,
+                "has_agent": False,
+                "has_amount": False,
+                "errors": set(),
+            }
+            by_key[key] = bucket
+
+        bucket["has_agent"] = bucket["has_agent"] or has_agent
+        bucket["has_amount"] = bucket["has_amount"] or has_amount
+        bucket["errors"].add(err_str)
+
+        apl_agent = str(row.get("APL Agent Name") or "").strip()
+        if apl_agent and apl_agent.lower() != "nan":
+            bucket["apl_agents"].add(apl_agent)
+        icm_agent = str(row.get("ICM Agent Name") or "").strip()
+        if icm_agent and icm_agent.lower() != "nan":
+            bucket["icm_agents"].add(icm_agent)
+
+        bucket["apl_amount_sum"] = round(bucket["apl_amount_sum"] + clean_amount(row.get("APL Amount")), 2)
+        bucket["icm_amount_sum"] = round(bucket["icm_amount_sum"] + clean_amount(row.get("ICM Amount")), 2)
+
+    rows_out = []
+    for bucket in by_key.values():
+        if bucket["has_agent"] and bucket["has_amount"]:
+            category = "Both"
+        elif bucket["has_agent"]:
+            category = "Agent_Only"
+        else:
+            category = "Amount_Only"
+        difference = round(bucket["icm_amount_sum"] - bucket["apl_amount_sum"], 2)
+        rows_out.append(
+            {
+                "Policy Number": bucket["Policy Number"],
+                "Mismatch Category": category,
+                "APL Agent Name": " | ".join(sorted(bucket["apl_agents"])),
+                "ICM Agent Name": " | ".join(sorted(bucket["icm_agents"])),
+                "APL Amount": bucket["apl_amount_sum"],
+                "ICM Amount": bucket["icm_amount_sum"],
+                "Difference": difference,
+                "Issue": policies_to_update_issue(category, difference, bucket["errors"]),
+                "File Name": bucket["File Name"],
+            }
+        )
+
+    rows_out.sort(
+        key=lambda item: (
+            str(item.get("Mismatch Category") or ""),
+            str(item.get("File Name") or "").lower(),
+            str(item.get("Policy Number") or "").lower(),
+        )
+    )
+    return rows_out
+
+
+def count_icm_policies_from_detail(detail_csv, clean_policy_number):
+    """Distinct cleaned policy numbers in commission_detail_report.csv."""
+    path = Path(detail_csv)
+    if not path.is_file() or path.stat().st_size == 0:
+        return set()
+    policies = set()
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            raw = str(row.get("policy_number") or "").strip()
+            if not raw or raw.lower() == "nan":
+                continue
+            cleaned = clean_policy_number(raw) or raw
+            if cleaned:
+                policies.add(cleaned)
+    return policies
+
+
+def write_policies_to_update(rows, dest_dir, icm_policy_count):
+    """Write Policies_To_Update.xlsx with detail rows and a three-line summary block."""
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    out_xlsx = dest / "Policies_To_Update.xlsx"
+    detail = list(rows or [])
+    update_required = len(detail)
+    total_policies = int(icm_policy_count or 0)
+    pct = 0 if total_policies <= 0 else int(round(100 * update_required / total_policies))
+    summary_lines = [
+        ("Total Policies:", total_policies),
+        ("Update required:", update_required),
+        ("Update required %:", f"{pct}%"),
+    ]
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Policies_To_Update"
+    for col_index, header in enumerate(POLICIES_TO_UPDATE_COLUMNS, start=1):
+        sheet.cell(1, col_index, header)
+    for row_index, row in enumerate(detail, start=2):
+        for col_index, header in enumerate(POLICIES_TO_UPDATE_COLUMNS, start=1):
+            sheet.cell(row_index, col_index, row.get(header))
+    summary_start = len(detail) + 3
+    for offset, (label, value) in enumerate(summary_lines):
+        sheet.cell(summary_start + offset, 1, label)
+        sheet.cell(summary_start + offset, 2, value)
+    workbook.save(out_xlsx)
+
+    logger.info(
+        "Saved policies to update (%s policies, total ICM policies=%s, %s%%) -> %s",
+        update_required,
+        total_policies,
+        pct,
+        out_xlsx.resolve(),
+    )
+    return out_xlsx
+
+
 def run_apl_cross_validation(out, statement_name):
+    """Run APL validation. Returns (validation_rows, icm_policy_set)."""
     detail_csv = out / "commission_detail_report.csv"
+    empty = ([], set())
     if not detail_csv.is_file() or detail_csv.stat().st_size == 0:
         logger.info("APL cross-validation skipped: commission_detail_report.csv has no rows")
-        return
+        return empty
     apl_file = resolve_apl_statement(statement_name)
     if apl_file is None:
         logger.info(
             "APL cross-validation skipped for %s. Set APL_STATEMENT_PATH or APL_STATEMENT_DIR to the carrier statement.",
             statement_name,
         )
-        return
+        return empty
     mode = resolve_apl_validation_mode()
     validation_dir = out / "apl_icm_validation"
     validation_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Running APL cross-validation: mode=%s apl=%s parallel=%s", mode, apl_file, detail_csv)
     try:
         validator = load_apl_validator()
-        validator.validate_data(
-            str(apl_file),
-            str(detail_csv),
-            str(validation_dir / "Validation_Output.csv"),
-            str(validation_dir / "Validation_Output.xlsx"),
-            mode=mode,
-            single_grouped_file=True,
-            apl_df=cached_apl_frame(validator, apl_file),
+        validation_rows = (
+            validator.validate_data(
+                str(apl_file),
+                str(detail_csv),
+                str(validation_dir / "Validation_Output.csv"),
+                str(validation_dir / "Validation_Output.xlsx"),
+                mode=mode,
+                single_grouped_file=True,
+                apl_df=cached_apl_frame(validator, apl_file),
+            )
+            or []
         )
     except Exception as exc:
         logger.exception("APL cross-validation failed: %s", exc)
-        return
+        return empty
     logger.info("APL cross-validation written to %s", validation_dir)
+    icm_policies = count_icm_policies_from_detail(detail_csv, validator.clean_policy_number)
+    return validation_rows, icm_policies
 
 
 STATEMENT_NAME_SQL = """
@@ -4597,7 +4777,9 @@ def run_statement(
     api_base_url,
     statement_name=None,
     api_cache=None,
+    write_policies_to_update_file=True,
 ):
+    """Run one statement. Returns (ptu_rows, icm_policy_set)."""
     name = resolve_statement_name(conn, statement_uuid, statement_name)
     out = forecast_output_dir(statement_uuid, name)
     log_path = out / "forecast.log"
@@ -4608,7 +4790,16 @@ def run_statement(
         forecast.process_commissions()
         forecast.load_reference()
         write_forecast_output(statement_uuid, forecast, out=out)
-        run_apl_cross_validation(out, forecast.statement.get("name"))
+        validation_rows, icm_policies = run_apl_cross_validation(out, forecast.statement.get("name"))
+        validator = load_apl_validator()
+        ptu_rows = build_policies_to_update_rows(
+            validation_rows,
+            validator.clean_policy_number,
+            validator.clean_amount,
+        )
+        if write_policies_to_update_file:
+            write_policies_to_update(ptu_rows, out, len(icm_policies))
+        return ptu_rows, icm_policies
     finally:
         detach_forecast_log(handler)
 
@@ -4669,20 +4860,25 @@ def forecast_statement(
     api_base,
     api_cache,
     statement_name=None,
+    write_policies_to_update_file=True,
 ):
-    """Run one statement. Returns (connection, failed)."""
+    """Run one statement. Returns (connection, failed, ptu_rows, icm_policies)."""
     for attempt in (1, 2):
         try:
             conn = ensure_connection(conn, db_url, db_password)
-            run_statement(
+            ptu_rows, icm_policies = run_statement(
                 conn,
                 statement_uuid,
                 auth,
                 api_base,
                 statement_name=statement_name,
                 api_cache=api_cache,
+                write_policies_to_update_file=write_policies_to_update_file,
             )
-            return conn, False
+            return conn, False, ptu_rows or [], icm_policies or set()
+        except EmptyStatementError as exc:
+            logger.warning("%s — skipping", exc)
+            return conn, False, [], set()
         except Exception as exc:
             if attempt == 1 and is_connection_error(exc):
                 logger.warning(
@@ -4696,8 +4892,8 @@ def forecast_statement(
                 close_connection(conn)
                 conn = None
             logger.exception("Forecast failed for %s: %s", statement_uuid, exc)
-            return conn, True
-    return conn, True
+            return conn, True, [], set()
+    return conn, True, [], set()
 
 
 def parse_agency_id(argv):
@@ -4795,6 +4991,9 @@ def main():
                 if not files:
                     return 0
                 failed = 0
+                combined_ptu = []
+                combined_policies = set()
+                write_per_file = len(files) == 1
                 for index, row in enumerate(files, start=1):
                     logger.info(
                         "Forecasting review file %s/%s uuid=%s name=%s",
@@ -4803,7 +5002,7 @@ def main():
                         row["uuid"],
                         row.get("name"),
                     )
-                    conn, file_failed = forecast_statement(
+                    conn, file_failed, ptu_rows, icm_policies = forecast_statement(
                         conn,
                         db_url,
                         db_password,
@@ -4812,12 +5011,21 @@ def main():
                         api_base,
                         api_cache,
                         statement_name=row.get("name"),
+                        write_policies_to_update_file=write_per_file,
                     )
                     if file_failed:
                         failed += 1
+                    else:
+                        combined_ptu.extend(ptu_rows)
+                        combined_policies |= icm_policies
+                if not write_per_file:
+                    write_policies_to_update(combined_ptu, Path("forecast-out"), len(combined_policies))
                 logger.info("Review forecast finished: files=%s failed=%s", len(files), failed)
                 return 1 if failed else 0
             failed = 0
+            combined_ptu = []
+            combined_policies = set()
+            write_per_file = len(statement_uuids) == 1
             for index, statement_uuid in enumerate(statement_uuids, start=1):
                 logger.info(
                     "Forecasting file %s/%s uuid=%s",
@@ -4825,7 +5033,7 @@ def main():
                     len(statement_uuids),
                     statement_uuid,
                 )
-                conn, file_failed = forecast_statement(
+                conn, file_failed, ptu_rows, icm_policies = forecast_statement(
                     conn,
                     db_url,
                     db_password,
@@ -4833,9 +5041,15 @@ def main():
                     auth,
                     api_base,
                     api_cache,
+                    write_policies_to_update_file=write_per_file,
                 )
                 if file_failed:
                     failed += 1
+                else:
+                    combined_ptu.extend(ptu_rows)
+                    combined_policies |= icm_policies
+            if not write_per_file:
+                write_policies_to_update(combined_ptu, Path("forecast-out"), len(combined_policies))
             logger.info("Forecast finished: files=%s failed=%s", len(statement_uuids), failed)
             return 1 if failed else 0
         finally:
