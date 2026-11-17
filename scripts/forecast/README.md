@@ -12,6 +12,18 @@ python3 review_to_reconcile_file_forecast.py preprod <commission_statement_uuid>
 python3 review_to_reconcile_file_forecast.py prod review --agency_id 5
 ```
 
+### Local web UI
+
+Pick statement files by name (multi-select), run forecast, watch the live log, and download Excel outputs.
+
+From the repo root:
+
+```bash
+./scripts/forecast/run_ui
+```
+
+That starts the UI and opens http://127.0.0.1:8765.
+
 `config_preprod` and `config_prod` use the keys in `.env.example`. Values already set in the shell override the file.
 
 Fill in `config_preprod` or `config_prod`:
@@ -58,19 +70,14 @@ Values already set in the shell override the same keys in `config_preprod` or `c
 
 Files are written to `forecast-out/<commission_statement_uuid>/`:
 
-- `forecast.sql` — lookup rows used by the report joins, then the rows the forecast would insert
-- `reconciliation_exceptions.md` — statement records left in exception
-- `commission_detail_report.csv`
-- `apl_icm_validation/` — APL statement compared with `commission_detail_report.csv` when `APL_STATEMENT_PATH` or `APL_STATEMENT_DIR` is set
-- `ledger_summary.csv`
-- `agent_balances.csv`
+- `forecast.xlsx` — Excel summary (Summary, Exception codes, Exception rows, New policies, Row results)
 - `forecast.log` — one line per statement row, plus the connection and summary lines
-- `forecast.md` — markdown summary of the same run (counts, exception reasons, row table)
-- `forecast.xlsx` — the same summary in Excel (Summary, Exception codes, Exception rows, New policies, Row results)
-- `commission_split_report.csv`
-- `summary.json`
+- `summary.json` — compact run status
+- `commission_detail_report.csv` — internal input for APL cross-validation (not a primary deliverable)
+- `apl_icm_validation/` — APL statement compared with `commission_detail_report.csv` when `APL_STATEMENT_PATH` or `APL_STATEMENT_DIR` is set
+- `Policies_To_Update.xlsx` — agent/amount mismatches to review (consolidated under `forecast-out/` for multi-file runs)
 
-The split report lists the policies this forecast processed. `file_status` is `0` when every record cleared and `1` when any record is still in exception. The published report query only returns a file after `commission_statements.status` is `0`, so those exception rows are listed in `reconciliation_exceptions.md`.
+`file_status` is `0` when every record cleared and `1` when any record is still in exception. Exception detail lives in the Exception sheets of `forecast.xlsx`.
 
 A policy that does not already exist is created only in the forecast output. The script reads match-commission, the pay-to agent's reporting hierarchy, and `GET /api/v1/agencies/hierarchy`, then attaches commission splits the same way as fileprocessing: map match-commission `level_order` to agency level UUIDs, build the pay-to → manager chain, pick role amounts by the pay-to agent's grade (or the manager's grade when pay-to is a sub-agent), and seat Agency / Sales Leader / Agent / Sub Agent from that chain. Local policy and commission slabs are stored in the forecast output only; nothing is posted to the API and nothing is written to the database. New-policy agent resolve uses NPN, then appointment number, then user code, then a unique contacts full-name match (`entity = 'agent'`). If create fails, the row stays a `POLICY_MISMATCH` with an explicit reason tag: `reason=agent`, `reason=product`, `reason=effective_date`, or `reason=commission`. When the product `commission_processing_type` is FMV (`1`), the forecast uses the same amount shapes as file processing: Regular, Renewal, prorated Renewal for new business (`NB`), and Regular minus prorated Renewal when a prior renewal true-up payment already exists. Other products still match only the slab that covers the policy month.
 
