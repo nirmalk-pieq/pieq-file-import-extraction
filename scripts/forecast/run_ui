@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Start the Forecast web UI and open it in the browser.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+PORT="${FORECAST_UI_PORT:-8765}"
+URL="http://127.0.0.1:${PORT}"
+
+cd "$ROOT"
+
+if [[ -x "$ROOT/.venv/bin/uvicorn" ]]; then
+  UVICORN="$ROOT/.venv/bin/uvicorn"
+  PYTHON="$ROOT/.venv/bin/python"
+elif command -v uvicorn >/dev/null 2>&1; then
+  UVICORN="$(command -v uvicorn)"
+  PYTHON="$(command -v python3)"
+else
+  echo "uvicorn not found. Install deps first:" >&2
+  echo "  $ROOT/.venv/bin/pip install -r scripts/forecast/requirements.txt" >&2
+  exit 1
+fi
+
+# Ensure UI deps are importable.
+if ! "$PYTHON" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
+  echo "Installing Forecast UI dependencies…"
+  "$PYTHON" -m pip install --index-url https://pypi.org/simple -r "$ROOT/scripts/forecast/requirements.txt"
+fi
+
+open_browser() {
+  # Wait until the server answers, then open once.
+  for _ in $(seq 1 40); do
+    if curl -fsS "$URL/" >/dev/null 2>&1; then
+      if command -v open >/dev/null 2>&1; then
+        open "$URL" >/dev/null 2>&1 || true
+      elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$URL" >/dev/null 2>&1 || true
+      fi
+      return 0
+    fi
+    sleep 0.25
+  done
+}
+
+echo "Forecast UI → $URL"
+open_browser &
+exec "$UVICORN" ui.app:app --app-dir "$ROOT/scripts/forecast" --host 127.0.0.1 --port "$PORT"
