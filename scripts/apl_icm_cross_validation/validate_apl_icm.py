@@ -1201,6 +1201,7 @@ def validate_data(apl_path, parallel_path, out_csv_path, out_xlsx_path, amount_t
         write_statement_agent_totals(all_processed_rows, agent_dir)
 
     print("Done!")
+    return all_processed_rows
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
