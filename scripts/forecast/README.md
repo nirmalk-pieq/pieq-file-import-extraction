@@ -19,7 +19,11 @@ Pick statement files by name (multi-select), run forecast, watch the live log, a
 From the repo root:
 
 ```bash
+# macOS / Linux
 ./scripts/forecast/run_ui
+
+# Windows (cmd or PowerShell)
+scripts\forecast\run_ui
 ```
 
 That starts the UI and opens http://127.0.0.1:8765.
