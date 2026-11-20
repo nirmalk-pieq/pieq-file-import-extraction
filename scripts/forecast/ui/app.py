@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 from urllib import parse
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -26,7 +26,9 @@ UI_DIR = Path(__file__).resolve().parent
 FORECAST_DIR = UI_DIR.parent
 REPO_ROOT = FORECAST_DIR.parent.parent
 FORECAST_SCRIPT = FORECAST_DIR / "review_to_reconcile_file_forecast.py"
+PAYABLES_SCRIPT = UI_DIR / "run_payables_comparison.py"
 FORECAST_OUT = REPO_ROOT / "forecast-out"
+PAYABLES_OUT = FORECAST_OUT / "payables_comparison"
 STATIC_DIR = UI_DIR / "static"
 
 UUID_RE = re.compile(
@@ -58,8 +60,11 @@ LIMIT %s
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    state.loop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
+    state.loop = loop
+    payables_state.loop = loop
     FORECAST_OUT.mkdir(parents=True, exist_ok=True)
+    PAYABLES_OUT.mkdir(parents=True, exist_ok=True)
     yield
 
 
@@ -71,6 +76,9 @@ class RunRequest(BaseModel):
     mode: str = Field(..., pattern="^(files|review)$")
     uuids: Optional[List[str]] = None
     agency_id: Optional[int] = None
+
+
+PAYABLES_UPLOAD_SUFFIXES = {".csv", ".xlsx", ".xls"}
 
 
 class RunState:
@@ -101,6 +109,7 @@ class RunState:
 
 
 state = RunState()
+payables_state = RunState()
 
 
 def normalize_uuids(values: Optional[List[str]]) -> List[str]:
@@ -126,11 +135,7 @@ def normalize_uuids(values: Optional[List[str]]) -> List[str]:
 
 
 def build_command(req: RunRequest) -> List[str]:
-    python = os.environ.get("FORECAST_PYTHON") or "python3"
-    venv_python = REPO_ROOT / ".venv" / "bin" / "python"
-    if venv_python.is_file():
-        python = str(venv_python)
-    cmd = [python, str(FORECAST_SCRIPT), req.env]
+    cmd = [resolve_python(), str(FORECAST_SCRIPT), req.env]
     if req.mode == "review":
         if req.agency_id is None:
             raise ValueError("Agency ID is required for Review mode")
@@ -236,13 +241,13 @@ def fetch_statements(environment: str, agency_id: int, review_only: bool, limit:
     return files
 
 
-def broadcast(event: str, data: Any) -> None:
+def broadcast(run_state: RunState, event: str, data: Any) -> None:
     payload = {"event": event, "data": data}
-    with state.lock:
+    with run_state.lock:
         if event == "log" and isinstance(data, str):
-            state.lines.append(data)
-        subscribers = list(state.subscribers)
-        loop = state.loop
+            run_state.lines.append(data)
+        subscribers = list(run_state.subscribers)
+        loop = run_state.loop
     if not subscribers or loop is None:
         return
 
@@ -259,29 +264,202 @@ def broadcast(event: str, data: Any) -> None:
         pass
 
 
-def reader_thread(proc: subprocess.Popen, run_id: str) -> None:
+def reader_thread(run_state: RunState, proc: subprocess.Popen, run_id: str, label: str = "ui") -> None:
     assert proc.stdout is not None
     try:
         for raw in iter(proc.stdout.readline, ""):
             if not raw:
                 break
             line = raw.rstrip("\n")
-            broadcast("log", line)
+            broadcast(run_state, "log", line)
         proc.wait()
         code = proc.returncode
     except Exception as exc:  # noqa: BLE001
-        broadcast("log", f"[ui] reader error: {exc}")
+        broadcast(run_state, "log", f"[{label}] reader error: {exc}")
         code = proc.poll()
         if code is None:
             code = 1
     finally:
-        with state.lock:
-            if state.run_id == run_id:
-                state.running = False
-                state.exit_code = code
-                state.finished_at = time.time()
-                state.process = None
-        broadcast("done", {"exit_code": code, "run_id": run_id})
+        with run_state.lock:
+            if run_state.run_id == run_id:
+                run_state.running = False
+                run_state.exit_code = code
+                run_state.finished_at = time.time()
+                run_state.process = None
+        broadcast(run_state, "done", {"exit_code": code, "run_id": run_id})
+
+
+def resolve_python() -> str:
+    override = (os.environ.get("FORECAST_PYTHON") or "").strip()
+    if override:
+        return override
+    candidates = [
+        REPO_ROOT / ".venv" / "bin" / "python",
+        REPO_ROOT / ".venv" / "Scripts" / "python.exe",
+        REPO_ROOT / ".venv" / "Scripts" / "python",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    # Windows installs usually expose `python`, not `python3`.
+    return "python" if os.name == "nt" else "python3"
+
+
+def subprocess_extra_kwargs() -> Dict[str, Any]:
+    """Create a new process group so Stop can terminate the child tree on both OSes."""
+    if os.name == "nt":
+        # CREATE_NEW_PROCESS_GROUP lets us signal the child on Windows.
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def terminate_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError, AttributeError):
+        try:
+            proc.terminate()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def kill_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError, AttributeError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def stop_managed_process(proc: subprocess.Popen, soft_timeout: float = 8.0) -> int:
+    terminate_process(proc)
+    try:
+        return int(proc.wait(timeout=soft_timeout))
+    except subprocess.TimeoutExpired:
+        kill_process(proc)
+        return int(proc.wait(timeout=3))
+
+
+def sanitize_upload_name(name: str, fallback: str) -> str:
+    base = Path(str(name or "").strip()).name
+    if not base or base in {".", ".."}:
+        base = fallback
+    safe = re.sub(r"[^\w.\- ()]+", "_", base).strip(" ._")
+    return safe or fallback
+
+
+async def save_upload(upload: UploadFile, dest_dir: Path, label: str) -> Path:
+    if upload is None or not upload.filename:
+        raise HTTPException(status_code=400, detail=f"Select an {label} file")
+    filename = sanitize_upload_name(upload.filename, f"{label.lower()}.csv")
+    suffix = Path(filename).suffix.lower()
+    if suffix not in PAYABLES_UPLOAD_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} must be a CSV or Excel file (.csv, .xlsx, .xls)",
+        )
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / filename
+    # Avoid clobbering if both uploads somehow share a name.
+    if dest.exists():
+        dest = dest_dir / f"{dest.stem}_{label.lower()}{dest.suffix}"
+    try:
+        data = await upload.read()
+    finally:
+        await upload.close()
+    if not data:
+        raise HTTPException(status_code=400, detail=f"{label} file is empty")
+    dest.write_bytes(data)
+    return dest
+
+
+def make_sse_stream(run_state: RunState) -> StreamingResponse:
+    queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
+    with run_state.lock:
+        run_state.subscribers.append(queue)
+        backlog = list(run_state.lines)
+        snap = {
+            "running": run_state.running,
+            "run_id": run_state.run_id,
+            "exit_code": run_state.exit_code,
+            "command": list(run_state.command),
+        }
+
+    async def event_gen():
+        try:
+            yield f"event: status\ndata: {json.dumps(snap)}\n\n"
+            for line in backlog:
+                yield f"event: log\ndata: {json.dumps(line)}\n\n"
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield "event: ping\ndata: {}\n\n"
+                    continue
+                event = item.get("event", "message")
+                yield f"event: {event}\ndata: {json.dumps(item.get('data'))}\n\n"
+                if event == "done":
+                    break
+        finally:
+            with run_state.lock:
+                if queue in run_state.subscribers:
+                    run_state.subscribers.remove(queue)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def collect_payables_files(folder: Path) -> List[Dict[str, str]]:
+    files: List[Dict[str, str]] = []
+    preferred = (
+        "Grouped_Policy_Combined.xlsx",
+        "Grouped_Policy_Combined.csv",
+        "Validation_Output.xlsx",
+        "Validation_Output.csv",
+        "Passed_Output.xlsx",
+        "Passed_Output.csv",
+        "Grouped_Policy_Passed.xlsx",
+        "Grouped_Policy_Failed.xlsx",
+    )
+    for name in preferred:
+        path = folder / name
+        if path.is_file():
+            files.append(
+                {
+                    "name": name,
+                    "path": path.relative_to(FORECAST_OUT).as_posix(),
+                }
+            )
+    segregated = folder / "Segregated_Errors"
+    if segregated.is_dir():
+        for path in sorted(segregated.iterdir()):
+            if path.is_file() and path.suffix.lower() in {".csv", ".xlsx"}:
+                files.append(
+                    {
+                        "name": f"Segregated_Errors/{path.name}",
+                        "path": path.relative_to(FORECAST_OUT).as_posix(),
+                    }
+                )
+    return files
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -354,7 +532,7 @@ async def start_run(req: RunRequest) -> Dict[str, Any]:
             text=True,
             bufsize=1,
             env=env,
-            start_new_session=True,
+            **subprocess_extra_kwargs(),
         )
     except OSError as exc:
         with state.lock:
@@ -367,9 +545,11 @@ async def start_run(req: RunRequest) -> Dict[str, Any]:
     with state.lock:
         state.process = proc
 
-    broadcast("log", f"[ui] Starting: {' '.join(command)}")
-    broadcast("log", f"[ui] Working directory: {REPO_ROOT}")
-    threading.Thread(target=reader_thread, args=(proc, run_id), daemon=True).start()
+    broadcast(state, "log", f"[ui] Starting: {' '.join(command)}")
+    broadcast(state, "log", f"[ui] Working directory: {REPO_ROOT}")
+    threading.Thread(
+        target=reader_thread, args=(state, proc, run_id, "ui"), daemon=True
+    ).start()
     return {"ok": True, "run_id": run_id, "command": command}
 
 
@@ -381,71 +561,189 @@ async def stop_run() -> Dict[str, Any]:
         running = state.running
     if not running or proc is None or proc.poll() is not None:
         return {"ok": True, "stopped": False, "message": "No active forecast"}
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    broadcast("log", "[ui] Stop requested — terminating forecast process")
-    try:
-        proc.wait(timeout=8)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.wait(timeout=3)
+    broadcast(state, "log", "[ui] Stop requested — terminating forecast process")
+    exit_code = stop_managed_process(proc)
     with state.lock:
         if state.run_id == run_id:
             state.running = False
-            state.exit_code = proc.returncode
+            state.exit_code = exit_code
             state.finished_at = time.time()
             state.process = None
-    broadcast("done", {"exit_code": proc.returncode, "run_id": run_id, "stopped": True})
-    return {"ok": True, "stopped": True, "exit_code": proc.returncode}
+    broadcast(
+        state,
+        "done",
+        {"exit_code": exit_code, "run_id": run_id, "stopped": True},
+    )
+    return {"ok": True, "stopped": True, "exit_code": exit_code}
 
 
 @app.get("/api/run/stream")
 async def stream_run() -> StreamingResponse:
-    queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
-    with state.lock:
-        state.subscribers.append(queue)
-        backlog = list(state.lines)
-        snap = {
-            "running": state.running,
-            "run_id": state.run_id,
-            "exit_code": state.exit_code,
-            "command": list(state.command),
-        }
+    return make_sse_stream(state)
 
-    async def event_gen():
-        try:
-            yield f"event: status\ndata: {json.dumps(snap)}\n\n"
-            for line in backlog:
-                yield f"event: log\ndata: {json.dumps(line)}\n\n"
-            while True:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    yield "event: ping\ndata: {}\n\n"
-                    continue
-                event = item.get("event", "message")
-                yield f"event: {event}\ndata: {json.dumps(item.get('data'))}\n\n"
-                if event == "done":
-                    break
-        finally:
-            with state.lock:
-                if queue in state.subscribers:
-                    state.subscribers.remove(queue)
 
-    return StreamingResponse(
-        event_gen(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+@app.get("/api/payables/status")
+async def payables_status() -> Dict[str, Any]:
+    snap = payables_state.snapshot()
+    with payables_state.lock:
+        recent = list(payables_state.lines)[-80:]
+    snap["recent_lines"] = recent
+    return snap
+
+
+@app.post("/api/payables/run")
+async def start_payables_run(
+    apl_file: UploadFile = File(...),
+    icm_file: UploadFile = File(...),
+    mode: str = Form("icm"),
+    tolerance: float = Form(0.02),
+) -> Dict[str, Any]:
+    mode_norm = str(mode or "icm").strip().lower()
+    if mode_norm not in {"apl", "icm"}:
+        raise HTTPException(status_code=400, detail="Mode must be apl or icm")
+    try:
+        tolerance_val = float(tolerance)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Tolerance must be a number") from exc
+    if tolerance_val < 0:
+        raise HTTPException(status_code=400, detail="Tolerance must be non-negative")
+
+    if not PAYABLES_SCRIPT.is_file():
+        raise HTTPException(status_code=500, detail="Payables runner script is missing")
+
+    with payables_state.lock:
+        if payables_state.running and payables_state.process and payables_state.process.poll() is None:
+            raise HTTPException(status_code=409, detail="A payables comparison is already running")
+        run_id = str(uuid_lib.uuid4())
+
+    out_dir = PAYABLES_OUT / run_id
+    input_dir = out_dir / "input"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        apl_path = await save_upload(apl_file, input_dir, "APL")
+        icm_path = await save_upload(icm_file, input_dir, "ICM")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Could not save uploaded files: {exc}") from exc
+
+    command = [
+        resolve_python(),
+        str(PAYABLES_SCRIPT),
+        "--apl",
+        str(apl_path),
+        "--parallel",
+        str(icm_path),
+        "--out-dir",
+        str(out_dir),
+        "--mode",
+        mode_norm,
+        "--tolerance",
+        str(tolerance_val),
+    ]
+
+    with payables_state.lock:
+        payables_state.run_id = run_id
+        payables_state.started_at = time.time()
+        payables_state.finished_at = None
+        payables_state.exit_code = None
+        payables_state.running = True
+        payables_state.command = command
+        payables_state.lines.clear()
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+            **subprocess_extra_kwargs(),
+        )
+    except OSError as exc:
+        with payables_state.lock:
+            payables_state.running = False
+            payables_state.exit_code = 1
+            payables_state.finished_at = time.time()
+            payables_state.process = None
+        raise HTTPException(status_code=500, detail=f"Failed to start payables comparison: {exc}") from exc
+
+    with payables_state.lock:
+        payables_state.process = proc
+
+    broadcast(payables_state, "log", f"[payables] APL file: {apl_path.name}")
+    broadcast(payables_state, "log", f"[payables] ICM file: {icm_path.name}")
+    broadcast(payables_state, "log", f"[payables] Starting comparison (mode={mode_norm}, tolerance={tolerance_val})")
+    broadcast(payables_state, "log", f"[payables] Output folder: {out_dir}")
+    threading.Thread(
+        target=reader_thread,
+        args=(payables_state, proc, run_id, "payables"),
+        daemon=True,
+    ).start()
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "command": command,
+        "out_dir": str(out_dir.relative_to(FORECAST_OUT)),
+        "apl_file": apl_path.name,
+        "icm_file": icm_path.name,
+    }
+
+
+@app.post("/api/payables/stop")
+async def stop_payables_run() -> Dict[str, Any]:
+    with payables_state.lock:
+        proc = payables_state.process
+        run_id = payables_state.run_id
+        running = payables_state.running
+    if not running or proc is None or proc.poll() is not None:
+        return {"ok": True, "stopped": False, "message": "No active payables comparison"}
+    broadcast(payables_state, "log", "[payables] Stop requested — terminating comparison")
+    exit_code = stop_managed_process(proc)
+    with payables_state.lock:
+        if payables_state.run_id == run_id:
+            payables_state.running = False
+            payables_state.exit_code = exit_code
+            payables_state.finished_at = time.time()
+            payables_state.process = None
+    broadcast(
+        payables_state,
+        "done",
+        {"exit_code": exit_code, "run_id": run_id, "stopped": True},
     )
+    return {"ok": True, "stopped": True, "exit_code": exit_code}
+
+
+@app.get("/api/payables/stream")
+async def stream_payables_run() -> StreamingResponse:
+    return make_sse_stream(payables_state)
+
+
+@app.get("/api/payables/outputs")
+async def list_payables_outputs(limit: int = Query(40, ge=1, le=200)) -> Dict[str, Any]:
+    PAYABLES_OUT.mkdir(parents=True, exist_ok=True)
+    candidates = []
+    for entry in PAYABLES_OUT.iterdir():
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        candidates.append((entry.stat().st_mtime, entry))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    runs: List[Dict[str, Any]] = []
+    for mtime, entry in candidates[:limit]:
+        runs.append(
+            {
+                "folder": entry.name,
+                "mtime": mtime,
+                "files": collect_payables_files(entry),
+            }
+        )
+    return {"root": str(PAYABLES_OUT), "runs": runs}
 
 
 def safe_under_forecast_out(rel_path: str) -> Path:
@@ -496,7 +794,7 @@ async def list_outputs(limit: int = Query(40, ge=1, le=200)) -> Dict[str, Any]:
     for entry in FORECAST_OUT.iterdir():
         if not entry.is_dir():
             continue
-        if entry.name.startswith(".") or entry.name == "Before Update":
+        if entry.name.startswith(".") or entry.name in {"Before Update", "payables_comparison"}:
             continue
         mtime = entry.stat().st_mtime
         candidates.append((mtime, entry))

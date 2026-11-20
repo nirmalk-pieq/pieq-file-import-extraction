@@ -15,86 +15,151 @@
     <header class="hero">
       <p class="brand">Forecast</p>
       <h1 class="tagline">Run commission statement forecasts without the terminal.</h1>
-      <p class="lede">Choose an agency, refresh the file list, multi-select statements by name, then run.</p>
+      <p class="lede">Choose an agency, refresh the file list, multi-select statements by name, then run. Or compare APL and ICM payables on their own.</p>
     </header>
 
-    <section class="run-panel" aria-label="Run controls">
-      <form id="run-form">
-        <div class="field-row">
-          <label class="field">
-            <span class="label">Environment</span>
-            <div class="segmented" role="group" aria-label="Environment">
-              <button type="button" class="seg active" data-env="prod">Prod</button>
-              <button type="button" class="seg" data-env="preprod">Preprod</button>
+    <nav class="tab-nav" aria-label="Main sections">
+      <button type="button" class="tab-btn active" data-tab="forecast">Forecast</button>
+      <button type="button" class="tab-btn" data-tab="payables">Payables comparison</button>
+    </nav>
+
+    <div id="tab-forecast" class="tab-panel active">
+      <section class="run-panel" aria-label="Run controls">
+        <form id="run-form">
+          <div class="field-row">
+            <label class="field">
+              <span class="label">Environment</span>
+              <div class="segmented" role="group" aria-label="Environment">
+                <button type="button" class="seg active" data-env="prod">Prod</button>
+                <button type="button" class="seg" data-env="preprod">Preprod</button>
+              </div>
+              <input type="hidden" name="env" id="env" value="prod" />
+            </label>
+
+            <label class="field">
+              <span class="label">Mode</span>
+              <div class="segmented" role="group" aria-label="Mode">
+                <button type="button" class="seg active" data-mode="files">Select files</button>
+                <button type="button" class="seg" data-mode="review">All Review</button>
+              </div>
+              <input type="hidden" name="mode" id="mode" value="files" />
+            </label>
+          </div>
+
+          <div class="field-row agency-row">
+            <label class="field">
+              <span class="label">Agency ID</span>
+              <input id="agency_id" name="agency_id" type="number" min="1" step="1" placeholder="e.g. 5" required />
+            </label>
+            <div class="field file-actions-field" id="file-actions">
+              <span class="label">Statement files</span>
+              <div class="file-actions">
+                <button type="button" class="btn ghost" id="refresh-files">Refresh files</button>
+                <label class="check-inline">
+                  <input type="checkbox" id="review-only" checked />
+                  Review only
+                </label>
+              </div>
             </div>
-            <input type="hidden" name="env" id="env" value="prod" />
+          </div>
+
+          <div class="field" id="files-field">
+            <div class="files-toolbar">
+              <input type="search" id="file-filter" placeholder="Filter by file name…" autocomplete="off" />
+              <div class="files-toolbar-actions">
+                <button type="button" class="btn tiny" id="select-all">Select all</button>
+                <button type="button" class="btn tiny" id="clear-selection">Clear</button>
+                <span class="selection-count" id="selection-count">0 selected</span>
+              </div>
+            </div>
+            <div id="file-list" class="file-list" role="group" aria-label="Statement files">
+              <p class="empty-note" id="files-empty">Enter an agency ID and click Refresh files.</p>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button type="submit" class="btn primary" id="run-btn">Run Forecast</button>
+            <button type="button" class="btn ghost" id="stop-btn" disabled>Stop</button>
+            <p class="status-line" id="status-line" aria-live="polite">Ready</p>
+          </div>
+        </form>
+      </section>
+
+      <section class="log-panel" aria-label="Live log">
+        <div class="panel-head">
+          <h2>Live log</h2>
+          <button type="button" class="btn tiny" id="clear-log">Clear</button>
+        </div>
+        <pre id="log" class="log" tabindex="0"></pre>
+      </section>
+
+      <section class="results-panel" aria-label="Recent outputs">
+        <div class="panel-head">
+          <h2>Excel outputs</h2>
+          <button type="button" class="btn tiny" id="refresh-outputs">Refresh</button>
+        </div>
+        <div id="root-files" class="file-strip"></div>
+        <div id="runs" class="runs"></div>
+      </section>
+    </div>
+
+    <div id="tab-payables" class="tab-panel" hidden>
+      <section class="run-panel" aria-label="Payables comparison controls">
+        <form id="payables-form">
+          <p class="panel-lede">Compare an APL carrier statement to ICM / Parallel payables. This does not run a forecast.</p>
+
+          <label class="field">
+            <span class="label">APL statement</span>
+            <input id="payables-apl" type="file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" required />
+            <span class="file-chosen" id="payables-apl-name">No file selected</span>
           </label>
 
           <label class="field">
-            <span class="label">Mode</span>
-            <div class="segmented" role="group" aria-label="Mode">
-              <button type="button" class="seg active" data-mode="files">Select files</button>
-              <button type="button" class="seg" data-mode="review">All Review</button>
-            </div>
-            <input type="hidden" name="mode" id="mode" value="files" />
+            <span class="label">ICM / Parallel payables</span>
+            <input id="payables-icm" type="file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" required />
+            <span class="file-chosen" id="payables-icm-name">No file selected</span>
           </label>
-        </div>
 
-        <div class="field-row agency-row">
-          <label class="field">
-            <span class="label">Agency ID</span>
-            <input id="agency_id" name="agency_id" type="number" min="1" step="1" placeholder="e.g. 5" required />
-          </label>
-          <div class="field file-actions-field" id="file-actions">
-            <span class="label">Statement files</span>
-            <div class="file-actions">
-              <button type="button" class="btn ghost" id="refresh-files">Refresh files</button>
-              <label class="check-inline">
-                <input type="checkbox" id="review-only" checked />
-                Review only
-              </label>
-            </div>
+          <div class="field-row">
+            <label class="field">
+              <span class="label">Driving side</span>
+              <div class="segmented" role="group" aria-label="Payables mode">
+                <button type="button" class="seg" data-payables-mode="apl">APL-driven</button>
+                <button type="button" class="seg active" data-payables-mode="icm">ICM-driven</button>
+              </div>
+              <input type="hidden" id="payables-mode" value="icm" />
+            </label>
+
+            <label class="field">
+              <span class="label">Amount tolerance</span>
+              <input id="payables-tolerance" type="number" min="0" step="0.01" value="0.02" />
+            </label>
           </div>
-        </div>
 
-        <div class="field" id="files-field">
-          <div class="files-toolbar">
-            <input type="search" id="file-filter" placeholder="Filter by file name…" autocomplete="off" />
-            <div class="files-toolbar-actions">
-              <button type="button" class="btn tiny" id="select-all">Select all</button>
-              <button type="button" class="btn tiny" id="clear-selection">Clear</button>
-              <span class="selection-count" id="selection-count">0 selected</span>
-            </div>
+          <div class="actions">
+            <button type="submit" class="btn primary" id="payables-run-btn">Run comparison</button>
+            <button type="button" class="btn ghost" id="payables-stop-btn" disabled>Stop</button>
+            <p class="status-line" id="payables-status-line" aria-live="polite">Ready</p>
           </div>
-          <div id="file-list" class="file-list" role="group" aria-label="Statement files">
-            <p class="empty-note" id="files-empty">Enter an agency ID and click Refresh files.</p>
-          </div>
+        </form>
+      </section>
+
+      <section class="log-panel" aria-label="Payables live log">
+        <div class="panel-head">
+          <h2>Live log</h2>
+          <button type="button" class="btn tiny" id="payables-clear-log">Clear</button>
         </div>
+        <pre id="payables-log" class="log" tabindex="0"></pre>
+      </section>
 
-        <div class="actions">
-          <button type="submit" class="btn primary" id="run-btn">Run Forecast</button>
-          <button type="button" class="btn ghost" id="stop-btn" disabled>Stop</button>
-          <p class="status-line" id="status-line" aria-live="polite">Ready</p>
+      <section class="results-panel" aria-label="Payables outputs">
+        <div class="panel-head">
+          <h2>Comparison outputs</h2>
+          <button type="button" class="btn tiny" id="payables-refresh-outputs">Refresh</button>
         </div>
-      </form>
-    </section>
-
-    <section class="log-panel" aria-label="Live log">
-      <div class="panel-head">
-        <h2>Live log</h2>
-        <button type="button" class="btn tiny" id="clear-log">Clear</button>
-      </div>
-      <pre id="log" class="log" tabindex="0"></pre>
-    </section>
-
-    <section class="results-panel" aria-label="Recent outputs">
-      <div class="panel-head">
-        <h2>Excel outputs</h2>
-        <button type="button" class="btn tiny" id="refresh-outputs">Refresh</button>
-      </div>
-      <div id="root-files" class="file-strip"></div>
-      <div id="runs" class="runs"></div>
-    </section>
+        <div id="payables-runs" class="runs"></div>
+      </section>
+    </div>
   </main>
   <script src="/static/app.js"></script>
 </body>

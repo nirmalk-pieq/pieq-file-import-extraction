@@ -80,9 +80,49 @@ body {
 
 .lede {
   margin: 0;
-  max-width: 42ch;
+  max-width: 48ch;
   color: var(--ink-soft);
   font-size: 1.05rem;
+}
+
+.tab-nav {
+  display: inline-flex;
+  gap: 0.35rem;
+  padding: 0.25rem;
+  margin: 0 0 0.25rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+}
+
+.tab-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  font-weight: 700;
+  font-size: 0.95rem;
+  padding: 0.55rem 1.1rem;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 160ms ease, color 160ms ease;
+}
+
+.tab-btn.active {
+  background: var(--teal);
+  color: #fff;
+}
+
+.tab-panel[hidden] {
+  display: none;
+}
+
+.panel-lede {
+  margin: 0 0 1rem;
+  color: var(--ink-soft);
+  font-size: 0.98rem;
 }
 
 .run-panel,
@@ -158,7 +198,9 @@ body {
 
 textarea,
 input[type="number"],
-input[type="search"] {
+input[type="search"],
+input[type="text"],
+input[type="file"] {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -169,9 +211,36 @@ input[type="search"] {
   resize: vertical;
 }
 
+input[type="file"] {
+  padding: 0.55rem 0.75rem;
+  cursor: pointer;
+}
+
+input[type="file"]::file-selector-button {
+  appearance: none;
+  margin-right: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper-2);
+  color: var(--ink);
+  font: inherit;
+  font-weight: 650;
+  font-size: 0.85rem;
+  padding: 0.35rem 0.8rem;
+  cursor: pointer;
+}
+
+.file-chosen {
+  font-size: 0.88rem;
+  color: var(--ink-soft);
+  word-break: break-word;
+}
+
 textarea:focus,
 input[type="number"]:focus,
-input[type="search"]:focus {
+input[type="search"]:focus,
+input[type="text"]:focus,
+input[type="file"]:focus {
   outline: 2px solid var(--teal-glow);
   border-color: var(--teal);
 }
