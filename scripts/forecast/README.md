@@ -14,7 +14,10 @@ python3 review_to_reconcile_file_forecast.py prod review --agency_id 5
 
 ### Local web UI
 
-Pick statement files by name (multi-select), run forecast, watch the live log, and download Excel outputs.
+The UI has two tabs:
+
+- **Forecast** — pick statement files by name (multi-select), run forecast, watch the live log, and download Excel outputs.
+- **Payables comparison** — run APL vs ICM / Parallel payables comparison alone (no forecast). Use the file pickers to select an APL statement and an ICM / Parallel payables file (`commission_detail_report.csv` or a Parallel Run export), choose APL-driven or ICM-driven mode, set tolerance, then **Run comparison**. Outputs land under `forecast-out/payables_comparison/<run_id>/` (`Grouped_Policy_Combined`, `Validation_Output`, `Segregated_Errors`, etc.) and appear in the Comparison outputs panel.
 
 From the repo root:
 
@@ -26,7 +29,7 @@ From the repo root:
 scripts\forecast\run_ui
 ```
 
-That starts the UI and opens http://127.0.0.1:8765.
+That starts the UI and opens http://127.0.0.1:8765. Forecast and Payables comparison both work on macOS and Windows: launchers use the local `.venv` when present, Stop terminates child processes on both OSes, and Payables uses file pickers (no typed paths).
 
 `config_preprod` and `config_prod` use the keys in `.env.example`. Values already set in the shell override the file.
 

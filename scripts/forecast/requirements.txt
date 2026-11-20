@@ -8,3 +8,4 @@ numpy
 openpyxl
 fastapi
 uvicorn
+python-multipart

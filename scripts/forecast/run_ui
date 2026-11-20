@@ -20,8 +20,8 @@ else
   exit 1
 fi
 
-# Ensure UI deps are importable.
-if ! "$PYTHON" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
+# Ensure UI deps are importable (multipart is required for Payables file uploads).
+if ! "$PYTHON" -c "import fastapi, uvicorn, multipart" >/dev/null 2>&1; then
   echo "Installing Forecast UI dependencies…"
   "$PYTHON" -m pip install --index-url https://pypi.org/simple -r "$ROOT/scripts/forecast/requirements.txt"
 fi
