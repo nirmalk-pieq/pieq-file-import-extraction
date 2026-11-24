@@ -155,6 +155,62 @@ def amounts_same_sign(apl_amt, icm_amt):
     return (apl_amt > 0) == (icm_amt > 0)
 
 
+def is_near_zero(amount, amount_tolerance):
+    return abs(float(amount)) <= amount_tolerance
+
+
+def zero_amount_mismatch(apl_amt, icm_amt, amount_tolerance):
+    """True when one side is ~$0 and the other is not."""
+    apl_zero = is_near_zero(apl_amt, amount_tolerance)
+    icm_zero = is_near_zero(icm_amt, amount_tolerance)
+    return apl_zero != icm_zero
+
+
+def is_apl_override_row(apl_row):
+    """True when the APL line is an override (policy …OVR and/or product OVR)."""
+    if apl_row is None:
+        return False
+    policy = str(apl_row.get(APLColumns.POLICY_NUMBER, "") or "")
+    product = str(apl_row.get(APLColumns.PRODUCT, "") or "")
+    blob = f"{policy} {product}".upper()
+    return "OVR" in blob
+
+
+def _event_total_key(row):
+    """ICM event key from total_commission (same payment / override bundle)."""
+    if row is None or not hasattr(row, "index"):
+        return ""
+    col_map = {
+        str(c).strip().lower().replace("_", "").replace(" ", ""): c for c in row.index
+    }
+    col = col_map.get("totalcommission")
+    if col is None:
+        return ""
+    raw = str(row.get(col, "") or "").strip()
+    if not raw or raw.lower() == "nan":
+        return ""
+    return f"{round(clean_amount(raw), 2):.2f}"
+
+
+def icm_event_claimed_by_override(par_item, par_list):
+    """True when another line in this ICM total_commission event already paired to an OVR APL row."""
+    event_key = _event_total_key(par_item["row"])
+    if not event_key:
+        return False
+    policy = clean_policy_number(par_item["row"].get(ParallelColumns.POLICY_NUMBER))
+    for other in par_list:
+        if other is par_item or not other.get("consumed"):
+            continue
+        if clean_policy_number(other["row"].get(ParallelColumns.POLICY_NUMBER)) != policy:
+            continue
+        if _event_total_key(other["row"]) != event_key:
+            continue
+        matched_apl = other.get("matched_apl")
+        if matched_apl and is_apl_override_row(matched_apl.get("row")):
+            return True
+    return False
+
+
 def check_amount_match(row, icm_amt_val, tolerance=0.02, require_same_sign=False):
     # A $0 Earned Credit on a row that already has Earned Commission must not
     # consume an ICM $0 split. Only a row whose own line amount is ~0 can match $0.
@@ -425,6 +481,22 @@ def pair_apl_and_icm(df_apl, df_par, amount_tolerance):
                 icm_amt_str = str(par_item['row'].get(ParallelColumns.AMOUNT, "")).strip()
                 if icm_amt_str.lower() == 'nan': icm_amt_str = ""
                 icm_amt_val = clean_amount(icm_amt_str)
+                # Exact same policy: allow 0↔120 so it surfaces as Amount mismatch.
+                # Partial/suffix APL (e.g. …K67 into override …K) must not steal a $0 split.
+                if apl_item.get('is_partial') and zero_amount_mismatch(
+                    apl_amt, icm_amt_val, amount_tolerance
+                ):
+                    continue
+                # Non-OVR APL must not steal an override-event ICM $0 (e.g. Richard $5
+                # ACA vs Richard $0 on the …OVR total_commission=3 event).
+                if (
+                    zero_amount_mismatch(apl_amt, icm_amt_val, amount_tolerance)
+                    and not is_near_zero(apl_amt, amount_tolerance)
+                    and is_near_zero(icm_amt_val, amount_tolerance)
+                    and not is_apl_override_row(apl_row)
+                    and icm_event_claimed_by_override(par_item, par_list)
+                ):
+                    continue
                 # Magnitude distance so APL -3.01 prefers ICM 3.01 over 1.08.
                 # Same sign wins ties so +7.50 does not steal ICM -7.50.
                 diff = abs(abs(apl_amt) - abs(icm_amt_val))
@@ -441,6 +513,7 @@ def pair_apl_and_icm(df_apl, df_par, amount_tolerance):
                 if apl_item['matched_par']:
                     continue
                 apl_row = apl_item['row']
+                _, _, apl_amt = apl_line_amount(apl_row)
 
                 for par_item in par_list:
                     if par_item['consumed']:
@@ -449,6 +522,11 @@ def pair_apl_and_icm(df_apl, df_par, amount_tolerance):
                     if icm_amt_str.lower() == 'nan':
                         icm_amt_str = ""
                     icm_amt_val = clean_amount(icm_amt_str)
+                    # Do not cross-bind $0 to $0 across different agents (false agent mismatches).
+                    if is_near_zero(apl_amt, amount_tolerance) and is_near_zero(icm_amt_val, amount_tolerance):
+                        continue
+                    if zero_amount_mismatch(apl_amt, icm_amt_val, amount_tolerance):
+                        continue
 
                     matched_col, _ = check_amount_match(
                         apl_row, icm_amt_val, amount_tolerance, require_same_sign=require_same_sign
@@ -462,9 +540,18 @@ def pair_apl_and_icm(df_apl, df_par, amount_tolerance):
 
         for apl_item in target_apl_items:
             if apl_item['matched_par']: continue
+            apl_row = apl_item['row']
+            _, _, apl_amt = apl_line_amount(apl_row)
 
             for par_item in par_list:
                 if par_item['consumed']: continue
+                icm_amt_str = str(par_item['row'].get(ParallelColumns.AMOUNT, "")).strip()
+                if icm_amt_str.lower() == 'nan':
+                    icm_amt_str = ""
+                icm_amt_val = clean_amount(icm_amt_str)
+                # Skip leftover binds that mix $0 with a non-zero amount, and $0↔$0.
+                if is_near_zero(apl_amt, amount_tolerance) or is_near_zero(icm_amt_val, amount_tolerance):
+                    continue
                 bind_match(apl_item, par_item)
                 break
 
