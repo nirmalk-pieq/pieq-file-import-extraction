@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env py
 """Tests for Issue 9: Agent Name Normalization — Strict Backend Parity.
 
 Derived from AgentNamesTest.kt, ValidateAgentTest.kt, and PolicyCreationDao.kt

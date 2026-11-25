@@ -23,7 +23,7 @@ Run the script with the APL statement and the forecast `commission_detail_report
 
 ```bash
 cd scripts/apl_icm_cross_validation
-python3 validate_apl_icm.py \
+py validate_apl_icm.py \
   --apl /path/to/APL_statement.csv \
   --parallel /path/to/scripts/forecast/forecast-out/<statement-uuid>/commission_detail_report.csv \
   --mode apl
@@ -32,7 +32,7 @@ python3 validate_apl_icm.py \
 Example:
 
 ```bash
-python3 validate_apl_icm.py \
+py validate_apl_icm.py \
   --apl versions/v6/input/APL_PR_7.CSV.csv \
   --parallel ../../scripts/forecast/forecast-out/a326dd09-c5a6-4140-8eff-d8a7b0cfb784/commission_detail_report.csv \
   --mode apl

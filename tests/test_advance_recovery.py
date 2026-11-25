@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env py
 """Tests for Issue 1: Add Advance Recovery to Commission Processing — Strict Backend Parity.
 
 Derived from AdvanceRecoveryProcessorTest.kt, MultiRecipientAdvanceRecoveryTest.kt,

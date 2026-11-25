@@ -90,7 +90,7 @@ flowchart TD
 
 ### Interactive Mode (Asks Confirmation for Each Policy)
 ```bash
-python3 import_policy_commission.py \
+py import_policy_commission.py \
   --file /Users/nirmalrajaak/Downloads/Commission_Upload_today.csv \
   --api-base-url https://preprod.api.pieq.ai \
   --token <YOUR_AUTH_TOKEN>
@@ -98,12 +98,12 @@ python3 import_policy_commission.py \
 
 ### Dry-Run Mode (Preview Payloads Locally Without Posting)
 ```bash
-python3 import_policy_commission.py --dry-run --file /Users/nirmalrajaak/Downloads/Commission_Upload_today.csv
+py import_policy_commission.py --dry-run --file /Users/nirmalrajaak/Downloads/Commission_Upload_today.csv
 ```
 
 ### Auto-Approve Mode (Skip Confirmation Prompt)
 ```bash
-python3 import_policy_commission.py --yes --file /Users/nirmalrajaak/Downloads/Commission_Upload_today.csv
+py import_policy_commission.py --yes --file /Users/nirmalrajaak/Downloads/Commission_Upload_today.csv
 ```
 
 ---

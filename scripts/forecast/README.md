@@ -8,8 +8,8 @@ From this folder, pass the environment name. That loads `config_preprod` or `con
 
 ```bash
 pip install -r requirements.txt
-python3 review_to_reconcile_file_forecast.py preprod <commission_statement_uuid> [<uuid> ...]
-python3 review_to_reconcile_file_forecast.py prod review --agency_id 5
+py review_to_reconcile_file_forecast.py preprod <commission_statement_uuid> [<uuid> ...]
+py review_to_reconcile_file_forecast.py prod review --agency_id 5
 ```
 
 ### Local web UI
@@ -31,7 +31,7 @@ scripts\forecast\run_ui
 
 That starts the UI and opens http://127.0.0.1:8765. Forecast and Payables comparison both work on macOS and Windows: launchers use the local `.venv` when present, Stop terminates child processes on both OSes, and Payables uses file pickers (no typed paths).
 
-`config_preprod` and `config_prod` use the keys in `.env.example`. Values already set in the shell override the file.
+`config_preprod` and `config_prod` use the keys in `.env.example`. Values already set in the shell override the file, except `USERNAME` / `PASSWORD` (and `PIEQ_API_USERNAME` / `PIEQ_API_PASSWORD`), which always come from the config file when present so Windows `USERNAME` does not shadow SSO login.
 
 Fill in `config_preprod` or `config_prod`:
 
@@ -55,9 +55,9 @@ Fill in `config_preprod` or `config_prod`:
 ## Run
 
 ```bash
-python3 review_to_reconcile_file_forecast.py preprod <commission_statement_uuid> [<uuid> ...]
-python3 review_to_reconcile_file_forecast.py prod <uuid-1> <uuid-2>
-python3 review_to_reconcile_file_forecast.py prod review --agency_id 5
+py review_to_reconcile_file_forecast.py preprod <commission_statement_uuid> [<uuid> ...]
+py review_to_reconcile_file_forecast.py prod <uuid-1> <uuid-2>
+py review_to_reconcile_file_forecast.py prod review --agency_id 5
 ```
 
 `review --agency_id <id>` forecasts every `commission_statements` row for that agency whose `stage` is `3` (Review). Each file is still written to its own `forecast-out/<uuid> - <statement name>/` folder. Pass one or more statement UUIDs to forecast only those files. Commas between UUIDs in one argument are also accepted. A failure on one file is logged and the remaining files still run. The process exits with code 1 when any file fails.
@@ -71,7 +71,7 @@ Logs go to stderr. A successful database login looks like:
 
 If the host, password, or network is wrong, the log line starts with `Database connection failed` and the script exits with code 1. Passwords and tokens are not written to the log.
 
-Values already set in the shell override the same keys in `config_preprod` or `config_prod`.
+Values already set in the shell override the same keys in `config_preprod` or `config_prod`, except SSO `USERNAME` / `PASSWORD` (see above).
 
 ## Output
 
@@ -93,7 +93,7 @@ A policy that does not already exist is created only in the forecast output. The
 Compare APL payables vs ICM (agent flow) ledger CSVs by agent name. Inputs are only `--apl` and `--icm` (alias `--latest`). Joins by normalized agent name (collapse spaces, case-insensitive). No Agent ID join. For each APL row, uses `Earned Commission` when non-zero, otherwise `Earned Credit`. Policy numbers strip `'` and flag `OVR` suffixes. An agent is matched when both files have the name and totals agree within $0.01.
 
 ```bash
-python3 validate_ledger_apl_vs_agent_flow.py \
+py validate_ledger_apl_vs_agent_flow.py \
   --apl "/path/PR_9_APL_PAYABLES.CSV" \
   --icm "/path/PR_9_Latest.csv" \
   --out "forecast-out/ledger_validation"

@@ -1,5 +1,5 @@
 # Production forecast config. Loaded with:
-#   python3 review_to_reconcile_file_forecast.py prod <commission_statement_uuid>
+#   py review_to_reconcile_file_forecast.py prod <commission_statement_uuid>
 # The script only SELECTs from the database and never POSTs or PUTs to the API base URL.
 #
 # Copy to config_prod and fill in local values. config_prod is gitignored.

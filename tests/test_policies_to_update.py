@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env py
 """Tests for forecast Policies_To_Update builder and writer."""
 
 from __future__ import annotations

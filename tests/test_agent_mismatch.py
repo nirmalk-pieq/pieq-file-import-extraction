@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env py
 """Tests for Issue 4: Agent NPN and Name Conflict Validation — Strict Backend Parity.
 
 Derived from ValidateAgentTest.kt, ValidateAgentAndPolicyTest.kt, and PolicyCreationDaoTest.kt

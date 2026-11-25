@@ -9,7 +9,7 @@ An enterprise-grade Python suite for validating policy import lists, processing 
 
 ### 1. Prerequisites
 - Python 3.9+
-- Recommended: Create a virtual environment (`python3 -m venv .venv` and `source .venv/bin/activate`)
+- Recommended: Create a virtual environment (`py -m venv .venv` and `source .venv/bin/activate`)
 
 ### 2. Installation
 ```bash
@@ -18,7 +18,7 @@ pip install -r requirements.txt
 
 ### 3. Running Scripts
 The utility scripts have been organized into the `scripts/` directory by domain:
-- **Pipeline (`scripts/pipeline/`)**: Run these to execute multi-step workflows. Example: `python3 scripts/pipeline/run_full_policy_pipeline.py`
+- **Pipeline (`scripts/pipeline/`)**: Run these to execute multi-step workflows. Example: `py scripts/pipeline/run_full_policy_pipeline.py`
 - **Policy (`scripts/policy/`)**: Normalization, enrichment, and validation of base policies.
 - **Commission (`scripts/commission/`)**: Commission calculation and splits processing.
 - **Utils (`scripts/utils/`)**: Generic CSV/Excel file manipulation utilities.
@@ -223,7 +223,7 @@ Matches the base APL Policy List against the MLB Policy Master database using th
 
 **Execution Command:**
 ```bash
-python3 scripts/pipeline/import_policy_list_with_validation.py \
+py scripts/pipeline/import_policy_list_with_validation.py \
   --base-file "(AUG 3)PROCESSED MASTERS IMPORT/APL_Policy_List_Product_Normalized.xlsx" \
   --master-file "(AUG 3)PROCESSED MASTERS IMPORT/MLB_policy_master_updated.xlsx" \
   --output-file "(AUG 3)PROCESSED MASTERS IMPORT/Policy_Extraction" \
@@ -243,7 +243,7 @@ Normalizes product descriptions and populates carrier metadata across target pol
 
 **Execution Command (Single or Multiple Policy Files):**
 ```bash
-python3 scripts/policy/normalize_policy_products.py \
+py scripts/policy/normalize_policy_products.py \
   -n "Product-Carrier Sheet_updated.xlsx" \
   -p "(AUG 3)PROCESSED MASTERS IMPORT/Policy_Extraction/Policy_List_Combined.xlsx" "MLB_policy_master.xlsx" \
   -o "(AUG 3)PROCESSED MASTERS IMPORT/Policy_Extraction"
@@ -256,7 +256,7 @@ Searches for unique policy numbers across the normalized dataset using `scripts/
 
 **Execution Command:**
 ```bash
-python3 scripts/commission/extract_unique_commissions.py \
+py scripts/commission/extract_unique_commissions.py \
   --policy-input "(AUG 3)PROCESSED MASTERS IMPORT/Policy_Extraction/Policy_List_Combined.xlsx" \
   --commission-input "(AUG 3)PROCESSED MASTERS IMPORT/Policy_Extraction/commission_import/split_commission" \
   --output-dir "(AUG 3)PROCESSED MASTERS IMPORT/unique_commission_import"
@@ -272,7 +272,7 @@ Validates the extracted unique commission records against the baseline rules in 
 
 **Execution Command:**
 ```bash
-python3 scripts/commission/validate_commissions.py \
+py scripts/commission/validate_commissions.py \
   --commission-input "(AUG 3)PROCESSED MASTERS IMPORT/unique_commission_import/final_unique_commission_Product_Normalized.xlsx" \
   --product-commission-file "ProductWise Commission Rate.xlsx" \
   --norm-file "Final Product Normalization Local.xlsx" \
@@ -298,7 +298,7 @@ python3 scripts/commission/validate_commissions.py \
 2. Create and activate a virtual environment:
    - **macOS / Linux:**
      ```bash
-     python3 -m venv .venv
+     py -m venv .venv
      source .venv/bin/activate
      ```
    - **Windows:**
@@ -321,7 +321,7 @@ python3 scripts/commission/validate_commissions.py \
 Runs Policy List Validation, Carrier Propagation, Commission Split Calculation, and Carrier Splitting in a single command.
 
 ```bash
-python3 scripts/pipeline/import_policy_list_with_validation.py \
+py scripts/pipeline/import_policy_list_with_validation.py \
   --base-file <base_policy_list.xlsx> \
   --master-file <master_policy_database.xlsx> \
   --output-file pipeline_output/ \
@@ -365,7 +365,7 @@ Matches policy upload file(s) or folder(s) against a Product Normalization refer
 
 **Single Policy File Usage:**
 ```bash
-python3 scripts/policy/normalize_policy_products.py \
+py scripts/policy/normalize_policy_products.py \
   -n "Product-Carrier Sheet_updated.xlsx" \
   -p "APL_Policy_List.xlsx" \
   -o "output_normalized/"
@@ -373,7 +373,7 @@ python3 scripts/policy/normalize_policy_products.py \
 
 **Multiple Policy Files & Directories Usage:**
 ```bash
-python3 scripts/policy/normalize_policy_products.py \
+py scripts/policy/normalize_policy_products.py \
   -n "Product-Carrier Sheet_updated.xlsx" \
   -p "APL_Policy_List.xlsx" "MLB_policy_master.xlsx" "commission_files_folder/" \
   -o "output_normalized/"
@@ -381,7 +381,7 @@ python3 scripts/policy/normalize_policy_products.py \
 
 **In-Place Overwrite Usage:**
 ```bash
-python3 scripts/policy/normalize_policy_products.py \
+py scripts/policy/normalize_policy_products.py \
   -n "Product-Carrier Sheet_updated.xlsx" \
   -p "APL_Policy_List.xlsx" "MLB_policy_master.xlsx" \
   --in-place
@@ -532,7 +532,7 @@ python scripts/commission/normalize_commission_splits.py -i input_commission.xls
 Interactively cross-validates policy, agent name, and commission amounts directly between APL Statements and ICM (Parallel Run) payables. It handles `OVR` prefix/suffix removal during matching and automatically groups its run into versioned `input/` and `output/` folders.
 
 ```bash
-python3 apl_icm_cross_validation/validate_apl_icm.py
+py apl_icm_cross_validation/validate_apl_icm.py
 ```
 *(The script will prompt you for the paths to the two required input files.)*
 

@@ -13,7 +13,7 @@ if [[ -x "$ROOT/.venv/bin/uvicorn" ]]; then
   PYTHON="$ROOT/.venv/bin/python"
 elif command -v uvicorn >/dev/null 2>&1; then
   UVICORN="$(command -v uvicorn)"
-  PYTHON="$(command -v python3)"
+  PYTHON="$(command -v py)"
 else
   echo "uvicorn not found. Install deps first:" >&2
   echo "  $ROOT/.venv/bin/pip install -r scripts/forecast/requirements.txt" >&2

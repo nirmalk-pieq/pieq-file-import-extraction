@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env py
 """Tests for Issue 6: Correct Policy Cancellation Gate — Strict Backend Parity.
 
 Derived from PolicyCancellationGateTest.kt and PolicyAdvanceActiveArf.kt
