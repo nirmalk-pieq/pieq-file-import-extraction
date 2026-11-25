@@ -1119,7 +1119,25 @@ SELECT DISTINCT ON (csr.id)
     a_carrier.npn AS carrier_agent_npn, ca_carrier.number AS carrier_agent_appointment_number,
     u_writing.code AS writing_agent_user_code,
     TRIM(CONCAT(contacts_writing.first_name, ' ', contacts_writing.last_name)) AS writing_agent_full_name,
-    a_writing.npn AS writing_agent_npn, ca_writing.number AS writing_agent_appointment_number
+    a_writing.npn AS writing_agent_npn, ca_writing.number AS writing_agent_appointment_number,
+    p.updated_at AS policy_updated_at, p.updated_by::text AS policy_updated_by_uuid,
+    (
+        SELECT COALESCE(NULLIF(TRIM(CONCAT(c.first_name, ' ', c.last_name)), ''), u.code)
+        FROM users u
+        LEFT JOIN contacts c ON c.relationship_id = u.uuid
+        WHERE u.uuid = p.updated_by
+        ORDER BY (c.agency_id = csr.agency_id) DESC NULLS LAST
+        LIMIT 1
+    ) AS policy_updated_by_name,
+    pc_last.updated_at AS commission_updated_at, pc_last.updated_by::text AS commission_updated_by_uuid,
+    (
+        SELECT COALESCE(NULLIF(TRIM(CONCAT(c.first_name, ' ', c.last_name)), ''), u.code)
+        FROM users u
+        LEFT JOIN contacts c ON c.relationship_id = u.uuid
+        WHERE u.uuid = pc_last.updated_by
+        ORDER BY (c.agency_id = csr.agency_id) DESC NULLS LAST
+        LIMIT 1
+    ) AS commission_updated_by_name
 FROM commission_statement_records csr
 JOIN commission_statements cs ON cs.uuid = csr.file_uuid AND cs.agency_id = csr.agency_id
 LEFT JOIN policies p
@@ -1139,6 +1157,13 @@ LEFT JOIN carrier_appointments ca_writing
   ON ca_writing.agent_id = u_writing.uuid AND ca_writing.carrier_id = cs.carrier_uuid
 LEFT JOIN products prod_fmv
   ON prod_fmv.agency_id = p.agency_id AND prod_fmv.uuid = p.product_id
+LEFT JOIN LATERAL (
+    SELECT pc.updated_at, pc.updated_by
+    FROM policy_commission pc
+    WHERE pc.agency_id = p.agency_id AND pc.policy_uuid = p.uuid
+    ORDER BY pc.updated_at DESC NULLS LAST
+    LIMIT 1
+) pc_last ON TRUE
 WHERE csr.file_uuid = %s::uuid
 ORDER BY csr.id, csr.row_order
 """
@@ -1856,7 +1881,32 @@ def prorata_needed(gross, match, premium):
     return original is not None and gross != original
 
 
-EXCEPTION_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
+AUDIT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+# (label, key in the exception dict) for the audit columns on the Exception rows sheet.
+EXCEPTION_AUDIT_COLUMNS = (
+    ("Policy Updated At", "policy_updated_at"),
+    ("Commission Updated At", "commission_updated_at"),
+    ("Policy Updated By", "policy_updated_by"),
+    ("Commission Updated By", "commission_updated_by"),
+)
+
+
+def _audit_time(value):
+    if isinstance(value, datetime):
+        return value.strftime(AUDIT_TIME_FORMAT)
+    return str(value) if value not in (None, "") else ""
+
+
+def exception_audit_fields(record):
+    """Last update time/user of the matched policy and its latest policy_commission row."""
+    return {
+        "policy_updated_at": _audit_time(record.get("policy_updated_at")),
+        "commission_updated_at": _audit_time(record.get("commission_updated_at")),
+        "policy_updated_by": record.get("policy_updated_by_name") or record.get("policy_updated_by_uuid") or "",
+        "commission_updated_by": record.get("commission_updated_by_name")
+        or record.get("commission_updated_by_uuid")
+        or "",
+    }
 
 
 class Forecast:
@@ -1943,7 +1993,7 @@ class Forecast:
                 "code": code,
                 "message": message,
                 "match_remarks": record.get("match_remarks"),
-                "exception_at": datetime.now().strftime(EXCEPTION_AT_FORMAT),
+                **exception_audit_fields(record),
             }
         )
         log_row(record, "result=exception code=%s message=%s", code, message)
@@ -3810,7 +3860,7 @@ def write_exceptions(path, forecast):
                 f"## {item['policy_number'] or 'Unknown policy'} ({item['record_uuid']})",
                 "",
                 f"- Row order: {item['row_order']}",
-                f"- Exception at: {item.get('exception_at') or ''}",
+                *(f"- {label}: {item.get(key) or ''}" for label, key in EXCEPTION_AUDIT_COLUMNS),
                 f"- Error code: {item['code']}",
                 f"- Message: {item['message']}",
                 f"- Match remarks: {item['match_remarks']}",
@@ -3910,7 +3960,10 @@ def _forecast_workbook_sheets(statement_uuid, forecast):
             create_policy.append([reason, count])
     else:
         create_policy.append(["No create-policy reason tags in exceptions", ""])
-    exception_rows = [["Row", "Policy number", "Exception code", "Reason", "Message", "Exception At"]]
+    exception_rows = [
+        ["Row", "Policy number", "Exception code", "Reason", "Message"]
+        + [label for label, _key in EXCEPTION_AUDIT_COLUMNS]
+    ]
     if forecast.exceptions:
         for item in sorted(forecast.exceptions, key=lambda row: (row.get("row_order") is None, row.get("row_order") or 0)):
             exception_rows.append(
@@ -3920,11 +3973,11 @@ def _forecast_workbook_sheets(statement_uuid, forecast):
                     item.get("code"),
                     _exception_reason(item.get("message")),
                     item.get("message"),
-                    item.get("exception_at"),
                 ]
+                + [item.get(key) for _label, key in EXCEPTION_AUDIT_COLUMNS]
             )
     else:
-        exception_rows.append(["", "", "", "", "No exceptions", ""])
+        exception_rows.append(["", "", "", "", "No exceptions"] + [""] * len(EXCEPTION_AUDIT_COLUMNS))
     local_policies = [["Policy UUID", "Product", "Effective date"]]
     if forecast.local_policies:
         for row in forecast.local_policies:
@@ -4049,24 +4102,24 @@ def write_forecast_md(path, statement_uuid, forecast):
         [
             "## Exception rows",
             "",
-            "| Row | Policy | Code | Reason | Message | Exception At |",
-            "| ---: | --- | --- | --- | --- | --- |",
+            "| Row | Policy | Code | Reason | Message | "
+            + " | ".join(label for label, _key in EXCEPTION_AUDIT_COLUMNS)
+            + " |",
+            "| ---: | --- | --- | --- | --- |" + " --- |" * len(EXCEPTION_AUDIT_COLUMNS),
         ]
     )
     if forecast.exceptions:
         for item in sorted(forecast.exceptions, key=lambda row: (row.get("row_order") is None, row.get("row_order") or 0)):
-            lines.append(
-                "| {row} | {policy} | {code} | {reason} | {message} | {at} |".format(
-                    row=_md_cell(item.get("row_order")),
-                    policy=_md_cell(item.get("policy_number")),
-                    code=_md_cell(item.get("code")),
-                    reason=_md_cell(_exception_reason(item.get("message"))),
-                    message=_md_cell(item.get("message")),
-                    at=_md_cell(item.get("exception_at")),
-                )
-            )
+            cells = [
+                item.get("row_order"),
+                item.get("policy_number"),
+                item.get("code"),
+                _exception_reason(item.get("message")),
+                item.get("message"),
+            ] + [item.get(key) for _label, key in EXCEPTION_AUDIT_COLUMNS]
+            lines.append("| " + " | ".join(_md_cell(cell) for cell in cells) + " |")
     else:
-        lines.append("| | | | | No exceptions | |")
+        lines.append("| | | | | No exceptions |" + " |" * len(EXCEPTION_AUDIT_COLUMNS))
     lines.append("")
 
     lines.extend(
