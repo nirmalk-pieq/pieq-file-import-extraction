@@ -1911,8 +1911,23 @@ def _audit_time(value):
     return str(value) if value not in (None, "") else ""
 
 
+LOCAL_POLICY_UPDATED_BY = "Forecast - new policy (not in DB)"
+
+
 def exception_audit_fields(record):
-    """Last update time/user of the matched policy and its latest policy_commission row."""
+    """Last update time/user of the matched policy and its latest policy_commission row.
+
+    A policy the forecast created locally has no database row, so it is labelled as such
+    with the time the forecast created it (its slabs are created at the same moment).
+    """
+    if not record.get("policy_updated_at") and record.get("forecast_policy_created_at"):
+        created = _audit_time(record.get("forecast_policy_created_at"))
+        return {
+            "policy_updated_at": created,
+            "commission_updated_at": created,
+            "policy_updated_by": LOCAL_POLICY_UPDATED_BY,
+            "commission_updated_by": LOCAL_POLICY_UPDATED_BY,
+        }
     return {
         "policy_updated_at": _audit_time(record.get("policy_updated_at")),
         "commission_updated_at": _audit_time(record.get("commission_updated_at")),
@@ -1949,6 +1964,7 @@ class Forecast:
         self.local_contacts = []
         self.local_commissions = []
         self.reattached_policies = set()
+        self.local_policy_created_at = {}
         self.auth = auth if isinstance(auth, dict) else {"token": auth}
         self.api_base_url = (api_base_url or "").rstrip("/")
         self.api_cache = api_cache if api_cache is not None else {}
@@ -2261,6 +2277,7 @@ class Forecast:
         record["policy_status_id"] = policy.get("status_id", 0)
         record["policy_uuid"] = policy["uuid"]
         record["forecast_policy_uuid"] = policy["uuid"]
+        record["forecast_policy_created_at"] = self.local_policy_created_at.get(policy["uuid"])
         record["policy_effective_date"] = policy.get("effective_date")
         record["pay_to_agent_user_id"] = policy.get("pay_to_agent_user_id")
         record["policy_carrier_id"] = policy.get("carrier_id")
@@ -2621,6 +2638,9 @@ class Forecast:
         ):
             if record.get(field):
                 local_policy[field] = record[field]
+        created_at = datetime.now()
+        self.local_policy_created_at[policy_uuid] = created_at
+        record["forecast_policy_created_at"] = created_at
         log_row(
             record,
             "result=local_policy_created policy_uuid=%s product=%s slabs=%s agent_resolved=%s",
