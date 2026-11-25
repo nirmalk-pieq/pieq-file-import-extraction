@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env py
 """Tests for Issue 7: Add MMP Contribution Processing — Strict Backend Parity.
 
 Derived from MarketingContributionEvaluatorTest.kt and CommissionProcessingService.kt

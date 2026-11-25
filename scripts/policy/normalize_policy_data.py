@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env py
 """
 Automated Policy Product Normalization & Carrier Mapping Pipeline
 

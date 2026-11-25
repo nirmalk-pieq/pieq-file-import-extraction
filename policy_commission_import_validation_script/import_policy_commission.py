@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env py
 """
 Policy Commission Data Import Script with Interactive Payload Confirmation & Logging
 ===================================================================================

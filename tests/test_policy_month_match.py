@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env py
 """Parity tests for 1-based policy months and MATCH lookback/lookahead (fileprocessing 2026.11.03.01)."""
 
 from __future__ import annotations

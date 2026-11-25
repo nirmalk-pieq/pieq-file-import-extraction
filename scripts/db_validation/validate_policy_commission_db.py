@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env py
 """
 2-Stage Policy Commission Import Validation & DB Verification Engine
 ====================================================================

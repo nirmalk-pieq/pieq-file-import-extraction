@@ -61,7 +61,7 @@ apl_commission_icm_commission_db_validation/
    cd apl_commission_icm_commission_db_validation
 
    # Create virtual environment
-   python3 -m venv venv
+   py -m venv venv
 
    # Activate virtual environment
    # On macOS/Linux:

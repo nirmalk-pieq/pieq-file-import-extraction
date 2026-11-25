@@ -12,7 +12,8 @@ Usage:
       Backfill forecast-out/upload/<statement name>/ from existing run folders.
 
 Loads config_preprod or config_prod from this folder. Environment variables
-already set in the shell take precedence.
+already set in the shell take precedence, except SSO USERNAME/PASSWORD
+(and PIEQ_API_USERNAME/PASSWORD) which always come from the config file when set.
 
 Environment:
   PIEQ_API_BASE_URL
@@ -869,6 +870,17 @@ def new_id():
     return str(uuid.uuid4())
 
 
+# Windows (and some shells) predefine USERNAME. Config-file SSO login must win.
+_CONFIG_OVERRIDE_KEYS = frozenset(
+    {
+        "USERNAME",
+        "PASSWORD",
+        "PIEQ_API_USERNAME",
+        "PIEQ_API_PASSWORD",
+    }
+)
+
+
 def load_env_file(environment):
     env_path = Path(__file__).resolve().parent / f"config_{environment}"
     if not env_path.exists():
@@ -881,7 +893,9 @@ def load_env_file(environment):
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
+        if not key:
+            continue
+        if key in _CONFIG_OVERRIDE_KEYS or key not in os.environ:
             os.environ[key] = value
             loaded += 1
     logger.info("Loaded %s value(s) from %s from location %s", loaded, env_path.name, env_path.resolve())
@@ -1009,8 +1023,8 @@ def obtain_token():
     if base_url and token_url.rstrip("/") == base_url.rstrip("/"):
         raise ForecastError("Token URL must not be the API base URL")
     client_id = (os.environ.get("client_id") or os.environ.get("KEYCLOAK_CLIENT_ID") or "pieq-app").strip()
-    username = (os.environ.get("USERNAME") or os.environ.get("PIEQ_API_USERNAME") or "").strip()
-    password = (os.environ.get("PASSWORD") or os.environ.get("PIEQ_API_PASSWORD") or "").strip()
+    username = (os.environ.get("PIEQ_API_USERNAME") or os.environ.get("USERNAME") or "").strip()
+    password = (os.environ.get("PIEQ_API_PASSWORD") or os.environ.get("PASSWORD") or "").strip()
     grant_type = (os.environ.get("grant_type") or "password").strip()
     if not username or not password:
         raise ForecastError("Missing USERNAME or PASSWORD")
