@@ -794,7 +794,7 @@ async def list_outputs(limit: int = Query(40, ge=1, le=200)) -> Dict[str, Any]:
     for entry in FORECAST_OUT.iterdir():
         if not entry.is_dir():
             continue
-        if entry.name.startswith(".") or entry.name in {"Before Update", "payables_comparison"}:
+        if entry.name.startswith(".") or entry.name in {"Before Update", "payables_comparison", "upload"}:
             continue
         mtime = entry.stat().st_mtime
         candidates.append((mtime, entry))

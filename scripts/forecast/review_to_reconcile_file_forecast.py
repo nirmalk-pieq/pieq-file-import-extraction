@@ -8,6 +8,8 @@ to PIEQ_API_BASE_URL and never writes the environment database.
 Usage:
   python3 review_to_reconcile_file_forecast.py <preprod|prod> <commission_statement_uuid> [<uuid> ...]
   python3 review_to_reconcile_file_forecast.py <preprod|prod> review --agency_id <agency_id>
+  python3 review_to_reconcile_file_forecast.py publish-upload [<forecast-out dir>]
+      Backfill forecast-out/upload/<statement name>/ from existing run folders.
 
 Loads config_preprod or config_prod from this folder. Environment variables
 already set in the shell take precedence.
@@ -35,6 +37,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import uuid
 from collections import defaultdict
@@ -1853,6 +1856,9 @@ def prorata_needed(gross, match, premium):
     return original is not None and gross != original
 
 
+EXCEPTION_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
 class Forecast:
     def __init__(self, conn, statement_uuid, auth=None, api_base_url=None, api_cache=None):
         self.conn = conn
@@ -1937,6 +1943,7 @@ class Forecast:
                 "code": code,
                 "message": message,
                 "match_remarks": record.get("match_remarks"),
+                "exception_at": datetime.now().strftime(EXCEPTION_AT_FORMAT),
             }
         )
         log_row(record, "result=exception code=%s message=%s", code, message)
@@ -3803,6 +3810,7 @@ def write_exceptions(path, forecast):
                 f"## {item['policy_number'] or 'Unknown policy'} ({item['record_uuid']})",
                 "",
                 f"- Row order: {item['row_order']}",
+                f"- Exception at: {item.get('exception_at') or ''}",
                 f"- Error code: {item['code']}",
                 f"- Message: {item['message']}",
                 f"- Match remarks: {item['match_remarks']}",
@@ -3902,7 +3910,7 @@ def _forecast_workbook_sheets(statement_uuid, forecast):
             create_policy.append([reason, count])
     else:
         create_policy.append(["No create-policy reason tags in exceptions", ""])
-    exception_rows = [["Row", "Policy number", "Exception code", "Reason", "Message"]]
+    exception_rows = [["Row", "Policy number", "Exception code", "Reason", "Message", "Exception At"]]
     if forecast.exceptions:
         for item in sorted(forecast.exceptions, key=lambda row: (row.get("row_order") is None, row.get("row_order") or 0)):
             exception_rows.append(
@@ -3912,10 +3920,11 @@ def _forecast_workbook_sheets(statement_uuid, forecast):
                     item.get("code"),
                     _exception_reason(item.get("message")),
                     item.get("message"),
+                    item.get("exception_at"),
                 ]
             )
     else:
-        exception_rows.append(["", "", "", "", "No exceptions"])
+        exception_rows.append(["", "", "", "", "No exceptions", ""])
     local_policies = [["Policy UUID", "Product", "Effective date"]]
     if forecast.local_policies:
         for row in forecast.local_policies:
@@ -4040,23 +4049,24 @@ def write_forecast_md(path, statement_uuid, forecast):
         [
             "## Exception rows",
             "",
-            "| Row | Policy | Code | Reason | Message |",
-            "| ---: | --- | --- | --- | --- |",
+            "| Row | Policy | Code | Reason | Message | Exception At |",
+            "| ---: | --- | --- | --- | --- | --- |",
         ]
     )
     if forecast.exceptions:
         for item in sorted(forecast.exceptions, key=lambda row: (row.get("row_order") is None, row.get("row_order") or 0)):
             lines.append(
-                "| {row} | {policy} | {code} | {reason} | {message} |".format(
+                "| {row} | {policy} | {code} | {reason} | {message} | {at} |".format(
                     row=_md_cell(item.get("row_order")),
                     policy=_md_cell(item.get("policy_number")),
                     code=_md_cell(item.get("code")),
                     reason=_md_cell(_exception_reason(item.get("message"))),
                     message=_md_cell(item.get("message")),
+                    at=_md_cell(item.get("exception_at")),
                 )
             )
     else:
-        lines.append("| | | | | No exceptions |")
+        lines.append("| | | | | No exceptions | |")
     lines.append("")
 
     lines.extend(
@@ -4440,6 +4450,206 @@ def forecast_output_dir(statement_uuid, statement_name=None):
     return Path("forecast-out") / folder
 
 
+UPLOAD_DIR_NAME = "upload"
+UPLOAD_FILES = (
+    ("forecast.xlsx", "forecast.xlsx"),
+    ("apl_icm_validation/Grouped_Policy_Combined.xlsx", "Grouped_Policy_Combined.xlsx"),
+)
+_UUID_PREFIX_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?: - )?"
+)
+
+
+def strip_uuid_prefix(folder_name):
+    """'<uuid> - <name>' -> '<name>'. Returns None when the folder is not a run folder."""
+    match = _UUID_PREFIX_RE.match(folder_name or "")
+    if not match:
+        return None
+    return folder_name[match.end():].strip() or folder_name[: match.end()].strip(" -")
+
+
+NO_ACTION_SUFFIX = " - No action needed"
+
+
+def publish_upload_copy(out, status=None):
+    """Copy the user-facing files of one run into forecast-out/upload/<name without uuid>/.
+
+    When ``status`` says no action is needed the folder is named
+    '<name> - No action needed' instead, and the other variant is removed.
+    The upload folder only ever holds forecast.xlsx and Grouped_Policy_Combined.xlsx;
+    anything else left there from an earlier run is removed. Returns the folder or None.
+    """
+    out = Path(out)
+    name = strip_uuid_prefix(out.name)
+    if name is None:
+        logger.warning("Upload copy skipped: %s is not a '<uuid> - <name>' run folder", out)
+        return None
+    upload_root = out.parent / UPLOAD_DIR_NAME
+    no_action = bool(status and status.get("no_action_needed"))
+    dest = upload_root / (f"{name}{NO_ACTION_SUFFIX}" if no_action else name)
+    stale = upload_root / (name if no_action else f"{name}{NO_ACTION_SUFFIX}")
+    if stale.is_dir():
+        shutil.rmtree(stale)
+    sources = [(out / src, dest / target) for src, target in UPLOAD_FILES if (out / src).is_file()]
+    if not sources:
+        logger.info("Upload copy skipped: no forecast.xlsx or Grouped_Policy_Combined.xlsx in %s", out)
+        return None
+    dest.mkdir(parents=True, exist_ok=True)
+    keep = {target.name for _src, target in sources}
+    for entry in dest.iterdir():
+        if entry.name not in keep:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+    for src, target in sources:
+        shutil.copy2(src, target)
+    logger.info("Upload copy written to %s (%s)", dest.resolve(), ", ".join(sorted(keep)))
+    return dest
+
+
+def publish_upload_copies(root=Path("forecast-out")):
+    """Backfill upload copies for every '<uuid> - <name>' run folder directly under root."""
+    root = Path(root)
+    published = []
+    report = []
+    validator = None
+    for entry in sorted(root.iterdir()):
+        name = strip_uuid_prefix(entry.name) if entry.is_dir() else None
+        if name is None:
+            continue
+        if validator is None:
+            validator = load_apl_validator()
+        status = status_from_run_folder(entry, validator)
+        report.append(status)
+        dest = publish_upload_copy(entry, status)
+        if dest is not None:
+            published.append(dest)
+    logger.info("Published %s upload folder(s) under %s", len(published), (root / UPLOAD_DIR_NAME).resolve())
+    log_run_report(report)
+    return published
+
+
+# ---------------------------------------------------------------------------
+# Per-file action report
+# ---------------------------------------------------------------------------
+
+RUN_REPORT = []
+
+
+def _missing_policy_count(validation_rows):
+    count = 0
+    for row in validation_rows or []:
+        err = str(row.get("Error") or "")
+        if "not found in" in err or "missing from Parallel Run" in err:
+            count += 1
+    return count
+
+
+def build_file_status(name, statement_uuid, exceptions, ptu_rows, validation_rows, validated):
+    """Decide whether a forecast file needs action.
+
+    No action needed = APL validation ran, 0 forecast exceptions, and no agent,
+    amount or missing-policy mismatches.
+    """
+    agent = sum(1 for row in ptu_rows or [] if row.get("Mismatch Category") in ("Agent_Only", "Both"))
+    amount = sum(1 for row in ptu_rows or [] if row.get("Mismatch Category") in ("Amount_Only", "Both"))
+    missing = _missing_policy_count(validation_rows)
+    exceptions = int(exceptions or 0)
+    reasons = []
+    if exceptions:
+        reasons.append("exceptions")
+    if agent:
+        reasons.append("agent mismatch")
+    if amount:
+        reasons.append("amount mismatch")
+    if missing:
+        reasons.append("missing policies")
+    if not validated:
+        reasons.append("APL validation not run")
+    return {
+        "file": name or str(statement_uuid),
+        "statement_uuid": str(statement_uuid or ""),
+        "no_action_needed": not reasons,
+        "action": "No action needed" if not reasons else "Action needed",
+        "exceptions": exceptions,
+        "agent_mismatches": agent,
+        "amount_mismatches": amount,
+        "missing_policies": missing,
+        "reason": ", ".join(reasons),
+    }
+
+
+def status_from_run_folder(folder, validator):
+    """Rebuild a file status from an existing run folder (used by publish-upload)."""
+    folder = Path(folder)
+    name = strip_uuid_prefix(folder.name)
+    statement_uuid = folder.name[: 36]
+    exceptions = 0
+    summary_path = folder / "summary.json"
+    if summary_path.is_file():
+        try:
+            exceptions = json.loads(summary_path.read_text(encoding="utf-8")).get("exceptions") or 0
+        except (OSError, json.JSONDecodeError):
+            exceptions = 0
+    validation_csv = folder / "apl_icm_validation" / "Validation_Output.csv"
+    validated = validation_csv.is_file()
+    validation_rows = []
+    if validated:
+        with validation_csv.open(newline="", encoding="utf-8-sig") as handle:
+            validation_rows = list(csv.DictReader(handle))
+    ptu_rows = build_policies_to_update_rows(
+        validation_rows, validator.clean_policy_number, validator.clean_amount
+    )
+    status = build_file_status(name, statement_uuid, exceptions, ptu_rows, validation_rows, validated)
+    if not summary_path.is_file():
+        status["no_action_needed"] = False
+        status["action"] = "Action needed"
+        status["reason"] = ", ".join(filter(None, [status["reason"], "no forecast summary"]))
+    return status
+
+
+def failed_file_status(name, statement_uuid):
+    return {
+        "file": name or str(statement_uuid),
+        "statement_uuid": str(statement_uuid),
+        "no_action_needed": False,
+        "action": "Failed",
+        "exceptions": "",
+        "agent_mismatches": "",
+        "amount_mismatches": "",
+        "missing_policies": "",
+        "reason": "forecast run failed (see log)",
+    }
+
+
+def log_run_report(entries):
+    if not entries:
+        return
+    headers = ["#", "File name", "Action", "Exceptions", "Agent mismatch", "Amount mismatch", "Missing policies", "Reason"]
+    keys = [None, "file", "action", "exceptions", "agent_mismatches", "amount_mismatches", "missing_policies", "reason"]
+    rows = []
+    for index, entry in enumerate(entries, start=1):
+        rows.append([str(index)] + [str(entry.get(key, "")) for key in keys[1:]])
+    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
+    numeric = {0, 3, 4, 5, 6}
+
+    def fmt(cells):
+        return "| " + " | ".join(
+            cell.rjust(widths[i]) if i in numeric else cell.ljust(widths[i]) for i, cell in enumerate(cells)
+        ) + " |"
+
+    rule = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+    no_action = sum(1 for entry in entries if entry.get("no_action_needed"))
+    lines = ["", "FORECAST FILE REPORT", rule, fmt(headers), rule]
+    lines.extend(fmt(row) for row in rows)
+    lines.append(rule)
+    lines.append(
+        f"Files: {len(entries)}  No action needed: {no_action}  Action needed: {len(entries) - no_action}"
+    )
+    logger.info("\n".join(lines))
+
+
 def write_forecast_output(statement_uuid, forecast, out=None):
     if out is None:
         out = forecast_output_dir(statement_uuid, forecast.statement.get("name"))
@@ -4797,6 +5007,16 @@ def run_statement(
             validator.clean_policy_number,
             validator.clean_amount,
         )
+        status = build_file_status(
+            forecast.statement.get("name") or name,
+            statement_uuid,
+            len(forecast.exceptions),
+            ptu_rows,
+            validation_rows,
+            (out / "apl_icm_validation" / "Validation_Output.csv").is_file(),
+        )
+        RUN_REPORT.append(status)
+        publish_upload_copy(out, status)
         if write_policies_to_update_file:
             write_policies_to_update(ptu_rows, out, len(icm_policies))
         return ptu_rows, icm_policies
@@ -4934,6 +5154,13 @@ def statement_uuids_from_args(tokens):
 
 def main():
     configure_logging()
+    if sys.argv[1:2] == ["publish-upload"]:
+        root = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("forecast-out")
+        if not root.is_dir():
+            logger.error("No forecast-out folder at %s", root.resolve())
+            return 2
+        publish_upload_copies(root)
+        return 0
     try:
         argv, agency_id = parse_agency_id(sys.argv[1:])
     except (ForecastError, ValueError) as exc:
@@ -5015,12 +5242,14 @@ def main():
                     )
                     if file_failed:
                         failed += 1
+                        RUN_REPORT.append(failed_file_status(row.get("name"), row["uuid"]))
                     else:
                         combined_ptu.extend(ptu_rows)
                         combined_policies |= icm_policies
                 if not write_per_file:
                     write_policies_to_update(combined_ptu, Path("forecast-out"), len(combined_policies))
                 logger.info("Review forecast finished: files=%s failed=%s", len(files), failed)
+                log_run_report(RUN_REPORT)
                 return 1 if failed else 0
             failed = 0
             combined_ptu = []
@@ -5045,12 +5274,14 @@ def main():
                 )
                 if file_failed:
                     failed += 1
+                    RUN_REPORT.append(failed_file_status(None, statement_uuid))
                 else:
                     combined_ptu.extend(ptu_rows)
                     combined_policies |= icm_policies
             if not write_per_file:
                 write_policies_to_update(combined_ptu, Path("forecast-out"), len(combined_policies))
             logger.info("Forecast finished: files=%s failed=%s", len(statement_uuids), failed)
+            log_run_report(RUN_REPORT)
             return 1 if failed else 0
         finally:
             close_connection(conn)
